@@ -1,0 +1,109 @@
+import pandas as pd
+from datetime import datetime, timedelta, timezone
+
+from alpaca.data.historical import CryptoHistoricalDataClient
+from alpaca.data.requests import CryptoQuoteRequest
+
+
+# ----------------------------
+# CONFIG
+# ----------------------------
+API_KEY = "YOUR_ALPACA_KEY"
+API_SECRET = "YOUR_ALPACA_SECRET"
+
+INSTRUMENTS = ["BTC/USD", "ETH/USD", "SOL/USD"]
+LIMIT_MINUTES = 10
+
+
+client = CryptoHistoricalDataClient(API_KEY, API_SECRET)
+
+
+# ----------------------------
+# FETCH QUOTES
+# ----------------------------
+def fetch_quotes(symbol: str, minutes: int):
+    end = datetime.now(tz=timezone.utc)
+    start = end - timedelta(minutes=minutes)
+
+    req = CryptoQuoteRequest(
+        symbol_or_symbols=symbol,
+        start=start,
+        end=end,
+        limit=minutes * 200  # quotes are frequent
+    )
+
+    data = client.get_crypto_quotes(req)
+    return data.get(symbol, [])
+
+
+# ----------------------------
+# MAIN
+# ----------------------------
+def main():
+    rows = []
+
+    for inst in INSTRUMENTS:
+        quotes = fetch_quotes(inst, LIMIT_MINUTES)
+
+        for q in quotes:
+            if q.bid_price is None or q.ask_price is None:
+                continue
+
+            ts = int(q.timestamp.timestamp())
+
+            bid = float(q.bid_price)
+            ask = float(q.ask_price)
+            bsz = float(q.bid_size or 0)
+            asz = float(q.ask_size or 0)
+
+            mid = (bid + ask) / 2
+
+            denom = bsz + asz
+            imbalance = (bsz - asz) / denom if denom else 0
+
+            rows.append({
+                "instrument": inst,
+                "ts": ts,
+                "mid": mid,
+                "imbalance": imbalance
+            })
+
+    if not rows:
+        raise RuntimeError("No quotes returned")
+
+    df = pd.DataFrame(rows)
+
+    # resample to 1-minute snapshots
+    df["dt"] = pd.to_datetime(df["ts"], unit="s")
+    df = (
+        df.sort_values("dt")
+          .groupby("instrument")
+          .resample("1min", on="dt")
+          .last()
+          .dropna()
+          .reset_index()
+    )
+
+    # forward return
+    df["mid_next"] = df.groupby("instrument")["mid"].shift(-1)
+    df["ret_1m"] = (df["mid_next"] - df["mid"]) / df["mid"]
+
+    # RankIC
+    ic_rows = []
+
+    for ts, g in df.groupby("dt"):
+        if len(g) < 2:
+            continue
+
+        ic = g["imbalance"].rank().corr(g["ret_1m"].rank())
+        ic_rows.append({"ts": ts, "rankic": ic})
+
+    ic_df = pd.DataFrame(ic_rows)
+
+    print("\nRankIC sample:")
+    print(ic_df.head())
+    print("\nMean IC:", ic_df["rankic"].mean())
+
+
+if __name__ == "__main__":
+    main()
