@@ -1,4 +1,6 @@
-from collections import defaultdict
+import os
+import asyncio
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -8,24 +10,44 @@ from alpaca.data.live import CryptoDataStream
 # ============================================================
 # CONFIG
 # ============================================================
-#change API key and secret when for personal use
-API_KEY = "PKFJ3LDODYHFVWSN5KXAYTSYQE"
-API_SECRET = "RXXSsjurakpvFX7SD8tGqrrLXrQresEpmdNb1JMqxqm"
 
-SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD"]
+# Use environment variables (recommended)
+# setx APCA_API_KEY_ID "your_key"
+# setx APCA_API_SECRET_KEY "your_secret"
+
+API_KEY = os.getenv("APCA_API_KEY_ID")
+API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+
+if not API_KEY or not API_SECRET:
+    raise RuntimeError("API keys not set in environment variables")
+
+SYMBOLS = [
+    "BTC/USD",
+    "ETH/USD",
+    "SOL/USD",
+    "AVAX/USD",
+    "LINK/USD",
+    "DOGE/USD"
+]
+
+ROLLING_WINDOW = 120   # minutes of IC history
 
 
 # ============================================================
 # STATE
 # ============================================================
+
 minute_imbalance = defaultdict(dict)
 minute_mid = defaultdict(dict)
 last_minute_seen = {}
+
+ic_history = deque(maxlen=ROLLING_WINDOW)
 
 
 # ============================================================
 # FEATURES
 # ============================================================
+
 def compute_quote_features(q):
     if q.bid_price is None or q.ask_price is None:
         return None
@@ -35,7 +57,11 @@ def compute_quote_features(q):
     bsz = float(q.bid_size or 0)
     asz = float(q.ask_size or 0)
 
+    if bid <= 0 or ask <= 0:
+        return None
+
     mid = (bid + ask) / 2
+
     denom = bsz + asz
     imb = (bsz - asz) / denom if denom else 0.0
 
@@ -43,8 +69,19 @@ def compute_quote_features(q):
 
 
 # ============================================================
-# RANKIC
+# RANK IC
 # ============================================================
+
+def compute_ic_stats():
+    if len(ic_history) < 10:
+        return None, None
+
+    s = pd.Series(ic_history)
+    mean_ic = s.mean()
+    tstat = mean_ic / (s.std(ddof=1) / (len(s) ** 0.5))
+    return mean_ic, tstat
+
+
 def try_compute_rankic(current_minute_ts):
     prev_min = current_minute_ts - 60
 
@@ -67,53 +104,79 @@ def try_compute_rankic(current_minute_ts):
 
     ic = df["imb"].rank().corr(df["ret"].rank())
 
+    if pd.isna(ic):
+        return
+
+    ic_history.append(ic)
+    mean_ic, tstat = compute_ic_stats()
+
     ts_str = datetime.fromtimestamp(
         current_minute_ts, tz=timezone.utc
     ).strftime("%H:%M:%S")
 
-    print(f"[{ts_str}] RankIC={ic:.4f}  n={len(df)}")
+    print(
+        f"[{ts_str}] RankIC={ic:.4f} "
+        f"n={len(df)} "
+        f"meanIC={mean_ic if mean_ic else float('nan'):.4f} "
+        f"t={tstat if tstat else float('nan'):.2f}"
+    )
 
 
 # ============================================================
 # STREAM HANDLER
 # ============================================================
+
 async def on_quote(q):
-    ts = int(q.timestamp.replace(tzinfo=timezone.utc).timestamp())
-    minute_ts = ts - ts % 60
-    sym = q.symbol
+    try:
+        ts = int(q.timestamp.timestamp())
+        minute_ts = ts - ts % 60
+        sym = q.symbol
 
-    feat = compute_quote_features(q)
-    if not feat:
-        return
+        feat = compute_quote_features(q)
+        if not feat:
+            return
 
-    mid, imb = feat
+        mid, imb = feat
 
-    minute_mid[minute_ts][sym] = mid
-    minute_imbalance[minute_ts][sym] = imb
+        minute_mid[minute_ts][sym] = mid
+        minute_imbalance[minute_ts][sym] = imb
 
-    last = last_minute_seen.get(sym)
+        last = last_minute_seen.get(sym)
 
-    if last is None:
-        last_minute_seen[sym] = minute_ts
-        return
+        if last is None:
+            last_minute_seen[sym] = minute_ts
+            return
 
-    if minute_ts > last:
-        try_compute_rankic(minute_ts)
-        last_minute_seen[sym] = minute_ts
+        if minute_ts > last:
+            try_compute_rankic(minute_ts)
+            last_minute_seen[sym] = minute_ts
+
+    except Exception as e:
+        print("Handler error:", e)
+
+
+# ============================================================
+# STREAM RUNNER WITH AUTO-RECONNECT
+# ============================================================
+
+async def run_stream_forever():
+    while True:
+        try:
+            print("Starting Alpaca Crypto RankIC stream...")
+
+            stream = CryptoDataStream(API_KEY, API_SECRET)
+            stream.subscribe_quotes(on_quote, *SYMBOLS)
+
+            await stream._run_forever()
+
+        except Exception as e:
+            print("Stream crashed — reconnecting in 5s:", e)
+            await asyncio.sleep(5)
 
 
 # ============================================================
 # MAIN
 # ============================================================
-def main():
-    print("Starting Alpaca Crypto RankIC stream...")
-    stream = CryptoDataStream(API_KEY, API_SECRET)
-
-    stream.subscribe_quotes(on_quote, *SYMBOLS)
-
-    # IMPORTANT: no await here
-    stream.run()
-
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(run_stream_forever())
