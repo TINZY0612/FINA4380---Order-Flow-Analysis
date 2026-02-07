@@ -1,108 +1,118 @@
+from collections import defaultdict
+from datetime import datetime, timezone
+
 import pandas as pd
-from datetime import datetime, timedelta, timezone
-
-from alpaca.data.historical import CryptoHistoricalDataClient
-from alpaca.data.requests import CryptoQuoteRequest
+from alpaca.data.live import CryptoDataStream
 
 
-# ----------------------------
+# ============================================================
 # CONFIG
-# ----------------------------
-API_KEY = "YOUR_ALPACA_KEY"
-API_SECRET = "YOUR_ALPACA_SECRET"
+# ============================================================
+#change API key and secret when for personal use
+API_KEY = "PKFJ3LDODYHFVWSN5KXAYTSYQE"
+API_SECRET = "RXXSsjurakpvFX7SD8tGqrrLXrQresEpmdNb1JMqxqm"
 
-INSTRUMENTS = ["BTC/USD", "ETH/USD", "SOL/USD"]
-LIMIT_MINUTES = 10
-
-
-client = CryptoHistoricalDataClient(API_KEY, API_SECRET)
+SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD"]
 
 
-# ----------------------------
-# FETCH QUOTES
-# ----------------------------
-def fetch_quotes(symbol: str, minutes: int):
-    end = datetime.now(tz=timezone.utc)
-    start = end - timedelta(minutes=minutes)
-
-    req = CryptoQuoteRequest(
-        symbol_or_symbols=symbol,
-        start=start,
-        end=end,
-        limit=minutes * 200  # quotes are frequent
-    )
-
-    data = client.get_crypto_quotes(req)
-    return data.get(symbol, [])
+# ============================================================
+# STATE
+# ============================================================
+minute_imbalance = defaultdict(dict)
+minute_mid = defaultdict(dict)
+last_minute_seen = {}
 
 
-# ----------------------------
+# ============================================================
+# FEATURES
+# ============================================================
+def compute_quote_features(q):
+    if q.bid_price is None or q.ask_price is None:
+        return None
+
+    bid = float(q.bid_price)
+    ask = float(q.ask_price)
+    bsz = float(q.bid_size or 0)
+    asz = float(q.ask_size or 0)
+
+    mid = (bid + ask) / 2
+    denom = bsz + asz
+    imb = (bsz - asz) / denom if denom else 0.0
+
+    return mid, imb
+
+
+# ============================================================
+# RANKIC
+# ============================================================
+def try_compute_rankic(current_minute_ts):
+    prev_min = current_minute_ts - 60
+
+    if prev_min not in minute_imbalance:
+        return
+
+    feats = minute_imbalance[prev_min]
+    mids0 = minute_mid[prev_min]
+    mids1 = minute_mid[current_minute_ts]
+
+    symbols = set(feats) & set(mids0) & set(mids1)
+
+    if len(symbols) < 2:
+        return
+
+    df = pd.DataFrame({
+        "imb": [feats[s] for s in symbols],
+        "ret": [(mids1[s] - mids0[s]) / mids0[s] for s in symbols],
+    })
+
+    ic = df["imb"].rank().corr(df["ret"].rank())
+
+    ts_str = datetime.fromtimestamp(
+        current_minute_ts, tz=timezone.utc
+    ).strftime("%H:%M:%S")
+
+    print(f"[{ts_str}] RankIC={ic:.4f}  n={len(df)}")
+
+
+# ============================================================
+# STREAM HANDLER
+# ============================================================
+async def on_quote(q):
+    ts = int(q.timestamp.replace(tzinfo=timezone.utc).timestamp())
+    minute_ts = ts - ts % 60
+    sym = q.symbol
+
+    feat = compute_quote_features(q)
+    if not feat:
+        return
+
+    mid, imb = feat
+
+    minute_mid[minute_ts][sym] = mid
+    minute_imbalance[minute_ts][sym] = imb
+
+    last = last_minute_seen.get(sym)
+
+    if last is None:
+        last_minute_seen[sym] = minute_ts
+        return
+
+    if minute_ts > last:
+        try_compute_rankic(minute_ts)
+        last_minute_seen[sym] = minute_ts
+
+
+# ============================================================
 # MAIN
-# ----------------------------
+# ============================================================
 def main():
-    rows = []
+    print("Starting Alpaca Crypto RankIC stream...")
+    stream = CryptoDataStream(API_KEY, API_SECRET)
 
-    for inst in INSTRUMENTS:
-        quotes = fetch_quotes(inst, LIMIT_MINUTES)
+    stream.subscribe_quotes(on_quote, *SYMBOLS)
 
-        for q in quotes:
-            if q.bid_price is None or q.ask_price is None:
-                continue
-
-            ts = int(q.timestamp.timestamp())
-
-            bid = float(q.bid_price)
-            ask = float(q.ask_price)
-            bsz = float(q.bid_size or 0)
-            asz = float(q.ask_size or 0)
-
-            mid = (bid + ask) / 2
-
-            denom = bsz + asz
-            imbalance = (bsz - asz) / denom if denom else 0
-
-            rows.append({
-                "instrument": inst,
-                "ts": ts,
-                "mid": mid,
-                "imbalance": imbalance
-            })
-
-    if not rows:
-        raise RuntimeError("No quotes returned")
-
-    df = pd.DataFrame(rows)
-
-    # resample to 1-minute snapshots
-    df["dt"] = pd.to_datetime(df["ts"], unit="s")
-    df = (
-        df.sort_values("dt")
-          .groupby("instrument")
-          .resample("1min", on="dt")
-          .last()
-          .dropna()
-          .reset_index()
-    )
-
-    # forward return
-    df["mid_next"] = df.groupby("instrument")["mid"].shift(-1)
-    df["ret_1m"] = (df["mid_next"] - df["mid"]) / df["mid"]
-
-    # RankIC
-    ic_rows = []
-
-    for ts, g in df.groupby("dt"):
-        if len(g) < 2:
-            continue
-
-        ic = g["imbalance"].rank().corr(g["ret_1m"].rank())
-        ic_rows.append({"ts": ts, "rankic": ic})
-
-    ic_df = pd.DataFrame(ic_rows)
-
-    print("\nRankIC sample:")
-    print(ic_df.head())
-    print("\nMean IC:", ic_df["rankic"].mean())
+    # IMPORTANT: no await here
+    stream.run()
 
 
 if __name__ == "__main__":
