@@ -58,10 +58,3 @@ The terminal will display a live confidence bar indicating the model's predicted
 Factor Decay: Traditional factors like OFI show strong short-term predictive power but decay rapidly as the prediction horizon increases.
 
 Deep Learning Advantage: DeepLOB achieved an accuracy of 43.27% on 3-class classification (Up/Down/Stationary), significantly outperforming random chance (33%) by capturing complex non-linear interactions between levels.
-
-❓ Questions or Issues?
-I noticed a few things while reviewing your files:
-
-Missing data/ folder: The GitHub repo currently doesn't show the raw .txt data files. If you want others to be able to run the study_deeplob.ipynb, you might want to add a link to the FI-2010 dataset in the README.
-
-FINA4380 versioning: Your commit history shows the PPTX was updated recently. Ensure any major data changes in that file are reflected in the final summary of the README.
