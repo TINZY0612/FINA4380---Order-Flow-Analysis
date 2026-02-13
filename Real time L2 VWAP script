@@ -1,0 +1,37 @@
+import ccxt
+import pandas as pd
+
+exchange = ccxt.binance()
+
+symbols = [
+    'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT',
+    'ADA/USDT', 'DOGE/USDT', 'SUI/USDT', 'ASTR/USDT', 'AVAX/USDT'
+]
+
+def get_l2_vwap(symbol):
+    try:
+        # Fetch L2 Order Book (Market Depth)
+        order_book = exchange.fetch_order_book(symbol, limit=50)
+        
+        # Helper to calculate weighted average of side (bids/asks)
+        def calc_side_vwap(levels):
+            total_vol = sum(level[1] for level in levels)
+            weighted_sum = sum(level[0] * level[1] for level in levels)
+            return weighted_sum / total_vol if total_vol > 0 else 0
+
+        bid_vwap = calc_side_vwap(order_book['bids'])
+        ask_vwap = calc_side_vwap(order_book['asks'])
+        mid_price = (order_book['bids'][0][0] + order_book['asks'][0][0]) / 2
+
+        return {
+            'Asset': symbol.split('/')[0],
+            'Mid_Price': f"{mid_price:.4f}",
+            'Bid_L2_VWAP': f"{bid_vwap:.4f}",
+            'Ask_L2_VWAP': f"{ask_vwap:.4f}",
+            'Imbalance': f"{((bid_vwap - ask_vwap) / mid_price) * 100:.4f}%"
+        }
+    except Exception as e:
+        return {'Asset': symbol, 'Error': 'Failed'}
+
+results = [get_l2_vwap(s) for s in symbols]
+print(pd.DataFrame(results).to_string(index=False))
