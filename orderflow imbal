@@ -1,0 +1,46 @@
+import ccxt
+import pandas as pd
+
+exchange = ccxt.binance()
+
+# Full list of requested symbols
+symbols = [
+    'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT',
+    'ADA/USDT', 'DOGE/USDT', 'SUI/USDT', 'ASTR/USDT', 'AVAX/USDT'
+]
+
+def fetch_order_flow(symbol):
+    try:
+        # Fetch the last 100 public trades
+        trades = exchange.fetch_trades(symbol, limit=100)
+        df = pd.DataFrame(trades, columns=['side', 'amount', 'price'])
+        
+        # Calculate Delta: (Market Buy Volume - Market Sell Volume)
+        buy_vol = df[df['side'] == 'buy']['amount'].sum()
+        sell_vol = df[df['side'] == 'sell']['amount'].sum()
+        delta = buy_vol - sell_vol
+        
+        # Imbalance Ratio: Percentage of the delta relative to total volume
+        total_vol = buy_vol + sell_vol
+        ratio = (delta / total_vol) * 100 if total_vol > 0 else 0
+        
+        # Status logic based on aggressive participation
+        if ratio > 15:
+            status = "Aggressive Buying"
+        elif ratio < -15:
+            status = "Aggressive Selling"
+        else:
+            status = "Balanced Flow"
+            
+        return {
+            'Asset': symbol.split('/')[0],
+            'Net_Delta': f"{delta:.2f}",
+            'Imbalance_%': f"{ratio:.2f}%",
+            'Status': status
+        }
+    except Exception:
+        return {'Asset': symbol, 'Status': 'Error'}
+
+# Execute and output
+results = [fetch_order_flow(s) for s in symbols]
+print(pd.DataFrame(results).to_string(index=False))
