@@ -15,8 +15,8 @@ from alpaca.data.live import CryptoDataStream
 # setx APCA_API_KEY_ID "your_key"
 # setx APCA_API_SECRET_KEY "your_secret"
 
-API_KEY = os.getenv("APCA_API_KEY_ID")
-API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+API_KEY = "PK6FUNQMKUTZGRLCDTHKSNO35P"
+API_SECRET = "5SP8dirzw9c71ztbgouFEokCq6cgXFzieEpgV456LkXq"
 
 if not API_KEY or not API_SECRET:
     raise RuntimeError("API keys not set in environment variables")

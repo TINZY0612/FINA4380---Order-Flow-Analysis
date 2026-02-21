@@ -1,0 +1,3 @@
+# For ccxt_l2_to_questdb.py: 5min 100ms L2 order book → QuestDB
+ccxt>=4.0.0
+questdb>=1.0.0

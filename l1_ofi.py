@@ -179,7 +179,7 @@ def analyze_performance():
 if __name__ == "__main__":
     socket = "wss://stream.binance.com:9443/stream"
     
-    ws = websocket.WebSocketApp(socket, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
+    ws = websocket.WebSocket(socket, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
     
     wst = threading.Thread(target=ws.run_forever)
     wst.daemon = True

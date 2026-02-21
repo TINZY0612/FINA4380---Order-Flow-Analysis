@@ -1,0 +1,17 @@
+# QuestDB with persistent data for ccxt_l2_to_questdb.py
+# Usage: docker compose -f docker-compose.questdb.yml up -d
+#        docker compose -f docker-compose.questdb.yml down
+services:
+  questdb:
+    image: questdb/questdb:9.3.2
+    container_name: questdb
+    ports:
+      - "9000:9000"   # REST API + Web Console (ingest and query)
+      - "9009:9009"   # ILP TCP (optional)
+      - "8812:8812"   # Postgres wire (optional)
+    volumes:
+      - questdb_data:/var/lib/questdb
+    restart: unless-stopped
+
+volumes:
+  questdb_data:
