@@ -1,7 +1,16 @@
 import ccxt
 import pandas as pd
+import time
 
-exchange = ccxt.binance()
+# 1. Initialize the exchange with rate limiting and error handling
+# If you are in the US, change 'binance' to 'binanceus'
+try:
+    exchange = ccxt.binance({
+        'enableRateLimit': True,
+        'options': {'defaultType': 'spot'}
+    })
+except Exception as e:
+    print(f"Initialization Error: {e}")
 
 symbols = [
     'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT',
@@ -11,9 +20,9 @@ symbols = [
 def get_l2_vwap(symbol):
     try:
         # Fetch L2 Order Book (Market Depth)
-        order_book = exchange.fetch_order_book(symbol, limit=50)
+        # Using a limit of 20 is often faster and less likely to trigger rate limits than 50
+        order_book = exchange.fetch_order_book(symbol, limit=20)
         
-        # Helper to calculate weighted average of side (bids/asks)
         def calc_side_vwap(levels):
             total_vol = sum(level[1] for level in levels)
             weighted_sum = sum(level[0] * level[1] for level in levels)
@@ -21,17 +30,38 @@ def get_l2_vwap(symbol):
 
         bid_vwap = calc_side_vwap(order_book['bids'])
         ask_vwap = calc_side_vwap(order_book['asks'])
-        mid_price = (order_book['bids'][0][0] + order_book['asks'][0][0]) / 2
+        
+        # Best bid and best ask for mid-price calculation
+        best_bid = order_book['bids'][0][0]
+        best_ask = order_book['asks'][0][0]
+        mid_price = (best_bid + best_ask) / 2
+
+        # Imbalance calculation: (Bid VWAP - Ask VWAP) relative to price
+        # Positive means buy-side depth is priced higher (bullish pressure)
+        imbalance = ((bid_vwap - ask_vwap) / mid_price) * 100
 
         return {
             'Asset': symbol.split('/')[0],
-            'Mid_Price': f"{mid_price:.4f}",
-            'Bid_L2_VWAP': f"{bid_vwap:.4f}",
-            'Ask_L2_VWAP': f"{ask_vwap:.4f}",
-            'Imbalance': f"{((bid_vwap - ask_vwap) / mid_price) * 100:.4f}%"
+            'Mid_Price': round(mid_price, 4),
+            'Bid_L2_VWAP': round(bid_vwap, 4),
+            'Ask_L2_VWAP': round(ask_vwap, 4),
+            'Imbalance %': f"{imbalance:.4f}%"
         }
     except Exception as e:
-        return {'Asset': symbol, 'Error': 'Failed'}
+        # This will now print the specific error (e.g., Network, Authentication, etc.)
+        return {'Asset': symbol, 'Error': str(e)[:30]} 
 
-results = [get_l2_vwap(s) for s in symbols]
-print(pd.DataFrame(results).to_string(index=False))
+# 2. Execution Loop with a small delay to respect API limits
+results = []
+print("Fetching Market Depth Data...")
+
+for s in symbols:
+    data = get_l2_vwap(s)
+    results.append(data)
+    time.sleep(0.2)  # 200ms sleep between requests
+
+# 3. Display results
+df = pd.DataFrame(results)
+print("\n--- L2 Order Book VWAP Analysis ---")
+print(df.to_string(index=False))
+
