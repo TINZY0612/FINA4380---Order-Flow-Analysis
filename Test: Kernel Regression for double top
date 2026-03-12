@@ -3,82 +3,103 @@ import matplotlib.pyplot as plt
 from statsmodels.nonparametric.kernel_regression import KernelReg
 from scipy.signal import find_peaks
 import json
-import websocket # pip install websocket-client
+import websocket
 
 # --- CONFIGURATION ---
-SYMBOL = "solusdt"  # You can change this to suiubtc, btcbusd, etc.
-LOOKBACK_SIZE = 200 # Number of L2 updates to store for analysis
-BANDWIDTH = 0.8     # Smoothing factor
+SYMBOL = "solusdt"
+LOOKBACK_SIZE = 120 
+BANDWIDTH = 0.6     
+SIMULATIONS = 100  # Decrease to 50 if your CPU is lagging
 
 prices = []
 
-def on_message(ws, message):
-    global prices
-    data = json.loads(message)
+def check_significance(raw_data, observed_smooth_var):
+    """
+    Monte Carlo Permutation Test:
+    Shuffles returns to see if a random walk could produce the same signal strength.
+    """
+    count = 0
+    returns = np.diff(raw_data)
+    t_sim = np.arange(len(raw_data))
     
-    # Check if 'bids' or 'b' exists to avoid KeyError
-    # Binance Partial Depth streams use 'bids' and 'asks' 
-    # whereas Diff. Depth streams use 'b' and 'a'
-    try:
-        if 'bids' in data:
-            bid = float(data['bids'][0][0])
-            ask = float(data['asks'][0][0])
-        elif 'b' in data:
-            bid = float(data['b'][0][0])
-            ask = float(data['a'][0][0])
-        else:
-            return # Not a price message, skip
-
-        mid_price = (bid + ask) / 2
-        prices.append(mid_price)
+    for _ in range(SIMULATIONS):
+        # Generate Random Walk from shuffled returns
+        shuffled_returns = np.random.permutation(returns)
+        rw = np.cumsum(np.insert(shuffled_returns, 0, raw_data[0]))
         
-        if len(prices) > LOOKBACK_SIZE:
-            prices.pop(0)
-            run_kernel_analysis(np.array(prices))
-            
-    except (IndexError, KeyError) as e:
-        print(f"Parsing error: {e}. Message received: {data}")
+        # Smooth the Random Walk
+        kr_sim = KernelReg(endog=rw, exog=t_sim, var_type='c', bw=[BANDWIDTH])
+        smoothed_rw, _ = kr_sim.fit(t_sim)
+        
+        if np.var(smoothed_rw) >= observed_smooth_var:
+            count += 1
+    
+    p_value = count / SIMULATIONS
+    confidence = (1 - p_value) * 100
+    return confidence
 
 def run_kernel_analysis(data_window):
     t = np.arange(len(data_window))
     
-    # 1. Kernel Smoothing
+    # 1. Fit Kernel to Real Data
     kr = KernelReg(endog=data_window, exog=t, var_type='c', bw=[BANDWIDTH])
     smoothed_price, _ = kr.fit(t)
     
-    # 2. Peak Detection
-    peaks, _ = find_peaks(smoothed_price, height=np.mean(smoothed_price))
-    
-    # 3. Quick Significance Check (Simplified for real-time speed)
-    # We compare the variance of the smooth curve vs the raw volatility
+    # 2. Calculate observed signal strength (Variance)
     observed_var = np.var(smoothed_price)
-    raw_var = np.var(data_window)
-    signal_to_noise = observed_var / raw_var
     
-    print(f"Instrument: {SYMBOL.upper()} | Peaks: {len(peaks)} | SNR: {signal_to_noise:.4f}")
+    # 3. Determine Significance
+    conf_score = check_significance(data_window, observed_var)
     
-    # Visualization (Note: In real-time, it's better to update a single plot 
-    # than opening new ones, but for logic testing, we use this):
-    if len(peaks) >= 2: # Potential Double Top/Bottom detected
-        plt.clf()
-        plt.plot(t, data_window, alpha=0.3, color='gray', label='Raw L2')
-        plt.plot(t, smoothed_price, color='blue', label='Kernel Smooth')
-        plt.scatter(t[peaks], smoothed_price[peaks], color='red', marker='x')
-        plt.title(f"Real-time {SYMBOL.upper()} Analysis")
-        plt.pause(0.01)
+    # --- PRINT MESSAGE LOGIC ---
+    if conf_score > 90:
+        print(f"[!] {SYMBOL.upper()} - SIGNIFICANT Pattern (Confidence: {conf_score:.1f}%)")
+    else:
+        print(f"[-] {SYMBOL.upper()} - Random Walk / Noise (Confidence: {conf_score:.1f}%)")
+    
+    # 4. Pattern Detection
+    peaks, _ = find_peaks(smoothed_price)
+    troughs, _ = find_peaks(-smoothed_price)
+    
+    # 5. Visuals
+    plt.clf()
+    plt.plot(t, data_window, alpha=0.3, color='gray', label='Raw Micro-price')
+    plt.plot(t, smoothed_price, color='blue', linewidth=2, label='Kernel Signal')
+    
+    # Text Box for Significance
+    color = 'green' if conf_score > 90 else 'red'
+    status = "SIGNIFICANT" if conf_score > 90 else "NOISE/RANDOM"
+    plt.text(5, np.max(data_window), f"Conf: {conf_score:.1f}% ({status})", 
+             bbox=dict(facecolor=color, alpha=0.5), fontsize=10)
+    
+    if len(peaks) > 0: plt.scatter(t[peaks], smoothed_price[peaks], color='red', marker='v')
+    if len(troughs) > 0: plt.scatter(t[troughs], smoothed_price[troughs], color='green', marker='^')
+    
+    plt.title(f"L2 Micro-price Analysis: {SYMBOL.upper()}")
+    plt.pause(0.01)
 
-def on_error(ws, error):
-    print(f"Error: {error}")
+def on_message(ws, message):
+    global prices
+    data = json.loads(message)
+    try:
+        # Standardize for Binance snapshot vs stream keys
+        b = data.get('bids') or data.get('b')
+        a = data.get('asks') or data.get('a')
+        if b and a:
+            bp, bv = float(b[0][0]), float(b[0][1])
+            ap, av = float(a[0][0]), float(a[0][1])
+            
+            # Micro-price calculation (incorporating OBI)
+            mp = (bp * av + ap * bv) / (bv + av)
+            prices.append(mp)
+            
+            if len(prices) > LOOKBACK_SIZE:
+                prices.pop(0)
+                run_kernel_analysis(np.array(prices))
+    except Exception as e:
+        pass
 
-def on_close(ws, close_status_code, close_msg):
-    print("### Stream Closed ###")
-
-# Start the WebSocket stream for L2 Data
-socket_url = f"wss://stream.binance.com:9443/ws/{SYMBOL}@depth5@100ms"
-ws = websocket.WebSocketApp(socket_url, 
-                            on_message=on_message, 
-                            on_error=on_error, 
-                            on_close=on_close)
-
-print(f"Connecting to live L2 feed for {SYMBOL}...")
+# Start
+plt.ion()
+ws = websocket.WebSocketApp(f"wss://stream.binance.com:9443/ws/{SYMBOL}@depth5@100ms", on_message=on_message)
 ws.run_forever()
