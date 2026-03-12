@@ -11,43 +11,39 @@ import sys
 SYMBOL = "btcusdt"
 LOOKBACK_SIZE = 150 
 HISTORY_SIZE = 1000  
-SIMULATIONS = 40    
+SIMULATIONS = 30     # Monte Carlo iterations for confidence score
+OFI_THRESHOLD = 0.2  # Min buying pressure to confirm a buy
+STOP_LOSS = 0.0015    # 0.15% hard stop
+TAKE_PROFIT = 0.0040  # 0.40% take profit
 
 # --- STATE ---
-balance = 1000.0  
+balance = 100000.0  
 position = 0      
 entry_price = 0
 prices, price_history = [], []
+ofi_buffer = []
 
-# Initialize UI carefully
+# Metrics
+total_trades, wins = 0, 0
+gross_profit, gross_loss = 0.0, 0.0
+prev_bid_v, prev_ask_v = 0.0, 0.0
+
+# Initialize UI
 plt.ion()
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'height_ratios': [2, 1]})
-fig.tight_layout(pad=4.0)
+fig.tight_layout(pad=4.5)
 
-def get_adaptive_bw(data):
-    std_dev = np.std(data)
-    n = len(data)
-    if std_dev == 0: return 0.5
-    return 1.06 * std_dev * (n**(-0.2))
-
-def detect_patterns(peaks, troughs, smoothed):
-    if len(troughs) >= 2:
-        t1, t2 = troughs[-2], troughs[-1]
-        if abs(smoothed[t1] - smoothed[t2]) / smoothed[t1] < 0.0004:
-            return "DOUBLE_BOTTOM"
-    if len(peaks) >= 2:
-        p1, p2 = peaks[-2], peaks[-1]
-        if abs(smoothed[p1] - smoothed[p2]) / smoothed[p1] < 0.0004:
-            return "DOUBLE_TOP"
-    if len(troughs) >= 3:
-        if smoothed[troughs[-2]] < smoothed[troughs[-3]] and smoothed[troughs[-2]] < smoothed[troughs[-1]]:
-            return "INV_H&S"
-    return None
+def get_ofi(bp, bv, ap, av):
+    """Calculates Order Flow Imbalance to confirm pattern strength."""
+    global prev_bid_v, prev_ask_v
+    ofi = (bv - prev_bid_v) - (av - prev_ask_v)
+    prev_bid_v, prev_ask_v = bv, av
+    return ofi / (bv + av) if (bv + av) > 0 else 0
 
 def check_significance(raw_data, observed_var, bw):
+    """Permutation Test: Compares signal variance vs shuffled noise variance."""
     count = 0
     returns = np.diff(raw_data)
-    # Force float64 time index to prevent Int32 overflow in statsmodels
     t_sim = np.arange(len(raw_data), dtype=np.float64)
     for _ in range(SIMULATIONS):
         shuffled = np.random.permutation(returns)
@@ -58,78 +54,116 @@ def check_significance(raw_data, observed_var, bw):
             count += 1
     return (1 - (count / SIMULATIONS)) * 100
 
-def run_analysis(data_window, full_history):
-    global balance, position, entry_price
-    # Always use float64 for time vectors
+def detect_patterns(peaks, troughs, smoothed):
+    """Recognizes structural patterns in smoothed data."""
+    if len(troughs) >= 2:
+        t1, t2 = troughs[-2], troughs[-1]
+        if abs(smoothed[t1] - smoothed[t2]) / smoothed[t1] < 0.0003:
+            return "DOUBLE_BOTTOM"
+    if len(peaks) >= 2:
+        p1, p2 = peaks[-2], peaks[-1]
+        if abs(smoothed[p1] - smoothed[p2]) / smoothed[p1] < 0.0003:
+            return "DOUBLE_TOP"
+    return None
+
+def run_analysis(data_window, ofi_avg):
+    global balance, position, entry_price, total_trades, wins, gross_profit, gross_loss
     t = np.arange(len(data_window), dtype=np.float64)
     current_p = data_window[-1]
     
-    bw = get_adaptive_bw(data_window)
+    # Kernel Smoothing
+    std_dev = np.std(data_window)
+    bw = 1.06 * std_dev * (len(data_window)**(-0.2)) if std_dev > 0 else 0.5
     kr = KernelReg(endog=data_window, exog=t, var_type='c', bw=[bw])
-    smoothed_price, _ = kr.fit(t)
+    smoothed, _ = kr.fit(t)
     
-    obs_var = np.var(smoothed_price)
+    # Confidence & Peak Detection
+    obs_var = np.var(smoothed)
     conf_score = check_significance(data_window, obs_var, bw)
-    
-    peaks, _ = find_peaks(smoothed_price, distance=15)
-    troughs, _ = find_peaks(-smoothed_price, distance=15)
-    pattern = detect_patterns(peaks, troughs, smoothed_price)
-    
-    is_sig = conf_score > 92
-    
-    if is_sig and (pattern in ["DOUBLE_BOTTOM", "INV_H&S"]) and position == 0:
-        position = balance / current_p
-        balance = 0
-        entry_price = current_p
-        sys.stdout.write(f"\n>>> BUY ({pattern}) @ {current_p:.2f}")
-    elif position > 0 and (is_sig and (pattern == "DOUBLE_TOP" or (len(peaks) > 0 and peaks[-1] > LOOKBACK_SIZE-10))):
-        balance = position * current_p
-        pnl = ((current_p - entry_price) / entry_price) * 100
-        sys.stdout.write(f"\n<<< SELL @ {current_p:.2f} | PnL: {pnl:.2f}%")
-        position = 0
+    peaks, _ = find_peaks(smoothed, distance=15)
+    troughs, _ = find_peaks(-smoothed, distance=15)
+    pattern = detect_patterns(peaks, troughs, smoothed)
 
-    # PLOTTING FIX: Ensure all inputs are explicitly cast to float64
-    ax1.clear()
-    ax1.plot(t, data_window.astype(np.float64), alpha=0.2, color='gray')
-    ax1.plot(t, smoothed_price.astype(np.float64), color='orange', linewidth=2)
-    ax1.set_title(f"Conf: {conf_score:.1f}% | Pattern: {pattern if pattern else 'None'}")
+    # --- TRADING EXECUTION ---
+    is_sig = conf_score > 90 # Significance threshold
     
-    if len(peaks) > 0: ax1.scatter(t[peaks], smoothed_price[peaks], color='red', marker='v')
-    if len(troughs) > 0: ax1.scatter(t[troughs], smoothed_price[troughs], color='green', marker='^')
+    if position == 0 and is_sig:
+        if pattern == "DOUBLE_BOTTOM" and ofi_avg > OFI_THRESHOLD:
+            position = balance / current_p
+            balance, entry_price = 0, current_p
+            sys.stdout.write(f"\n[BUY] @ {current_p:.2f} | Conf: {conf_score:.1f}% | OFI: {ofi_avg:.2f}")
+
+    elif position > 0:
+        pnl_pct = (current_p - entry_price) / entry_price
+        # Exit on TP, SL, or Bearish Reversal
+        if pnl_pct <= -STOP_LOSS or pnl_pct >= TAKE_PROFIT or (is_sig and pattern == "DOUBLE_TOP"):
+            profit_amt = (current_p - entry_price) * position
+            balance = position * current_p
+            total_trades += 1
+            if profit_amt > 0:
+                wins += 1
+                gross_profit += profit_amt
+            else:
+                gross_loss += abs(profit_amt)
+            
+            sys.stdout.write(f"\n[EXIT] @ {current_p:.2f} | PnL: {pnl_pct*100:.2f}% | Trades: {total_trades}")
+            position = 0
+
+    # --- UI UPDATE ---
+    ax1.clear()
+    ax1.plot(t, data_window, alpha=0.3, color='gray', label='Raw Micro-price')
+    ax1.plot(t, smoothed, color='orange', linewidth=2, label='Kernel Smooth')
+    
+    # Labeling ax1
+    ax1.set_ylabel("Price (USD)")
+    ax1.set_xlabel("Ticks (1 tick = 100ms)")
+    ax1.set_title(f"BTC/USDT | Pattern: {pattern} | Conf: {conf_score:.1f}%")
+    
+    # Plot Local Extrema
+    if len(peaks) > 0:
+        ax1.scatter(t[peaks], smoothed[peaks], color='red', marker='v', s=100, label='Sell Pressure')
+    if len(troughs) > 0:
+        ax1.scatter(t[troughs], smoothed[troughs], color='green', marker='^', s=100, label='Buy Pressure')
+    ax1.legend(loc='upper left', fontsize='small')
 
     ax2.clear()
-    ax2.plot(np.array(full_history, dtype=np.float64), color='black', linewidth=1)
+    ax2.plot(price_history[-200:], color='black')
+    ax2.set_ylabel("Trend Price")
+    ax2.set_xlabel("Last 200 Updates")
+    
     current_val = balance if position == 0 else position * current_p
-    ax2.set_title(f"Wallet: ${current_val:.2f}")
+    wr = (wins / total_trades * 100) if total_trades > 0 else 0
+    ax2.set_title(f"Portfolio: ${current_val:.2f} | Win Rate: {wr:.1f}%")
     
     plt.draw()
     plt.pause(0.001)
 
 def on_message(ws, message):
-    global prices, price_history
-    # CRITICAL: Force the JSON parser to treat all integers (like timestamps) as floats
-    # This stops the 'Int32' overflow crash in Visual Studio
+    global prices, ofi_buffer
+    # Fix for Int32 overflow: force all numbers to float
     data = json.loads(message, parse_int=float)
     
-    try:
-        b, a = data.get('bids') or data.get('b'), data.get('asks') or data.get('a')
-        if b and a:
-            bp, bv = float(b[0][0]), float(b[0][1])
-            ap, av = float(a[0][0]), float(a[0][1])
-            
-            mp = (bp * av + ap * bv) / (bv + av)
-            prices.append(mp)
-            price_history.append(mp)
-            
-            if len(prices) > LOOKBACK_SIZE: prices.pop(0)
-            if len(price_history) > HISTORY_SIZE: price_history.pop(0)
-            
-            if len(prices) == LOOKBACK_SIZE:
-                run_analysis(np.array(prices, dtype=np.float64), price_history)
-    except Exception:
-        pass
+    if 'b' not in data and 'bids' not in data: return
 
-# Reconnect Loop
+    try:
+        b = data.get('b') or data.get('bids')
+        a = data.get('a') or data.get('asks')
+        if not b or not a: return
+            
+        bp, bv, ap, av = float(b[0][0]), float(b[0][1]), float(a[0][0]), float(a[0][1])
+        mp = (bp * av + ap * bv) / (bv + av)
+        
+        prices.append(mp); price_history.append(mp)
+        ofi_buffer.append(get_ofi(bp, bv, ap, av))
+        
+        if len(prices) > LOOKBACK_SIZE: prices.pop(0)
+        if len(ofi_buffer) > 50: ofi_buffer.pop(0)
+        
+        if len(prices) == LOOKBACK_SIZE:
+            run_analysis(np.array(prices, dtype=np.float64), np.mean(ofi_buffer))
+    except Exception: pass
+
+# Main Loop with Auto-Reconnect
 while True:
     try:
         ws = websocket.WebSocketApp(
