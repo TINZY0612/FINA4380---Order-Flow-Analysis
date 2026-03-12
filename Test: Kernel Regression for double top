@@ -2,59 +2,83 @@ import numpy as np
 import matplotlib.pyplot as plt
 from statsmodels.nonparametric.kernel_regression import KernelReg
 from scipy.signal import find_peaks
+import json
+import websocket # pip install websocket-client
 
-# 1. Generate Synthetic Data (A "Double Top" buried in noise)
-np.random.seed(42)
-t = np.linspace(0, 10, 100)
-# Underlying pattern: two peaks
-pattern = -(t-2.5)**2 + 10 + -(t-7.5)**2 + 10 
-noise = np.random.normal(0, 2, 100)
-price = pattern + noise
+# --- CONFIGURATION ---
+SYMBOL = "solusdt"  # You can change this to suiubtc, btcbusd, etc.
+LOOKBACK_SIZE = 200 # Number of L2 updates to store for analysis
+BANDWIDTH = 0.8     # Smoothing factor
 
-# 2. Apply Kernel Regression (Nadaraya-Watson)
-# 'c' indicates a continuous variable; bw is the bandwidth (smoothing parameter)
-kr = KernelReg(endog=price, exog=t, var_type='c', bw=[0.5])
-smoothed_price, _ = kr.fit(t)
+prices = []
 
-# 3. Pattern Identification (Finding Peaks on the smoothed curve)
-peaks, _ = find_peaks(smoothed_price, height=np.mean(smoothed_price))
-
-# 4. Statistical Significance (Simplified Monte Carlo)
-def is_significant(data, smoothed, iterations=1000):
-    observed_var = np.var(smoothed)
-    count = 0
-    returns = np.diff(data)
+def on_message(ws, message):
+    global prices
+    data = json.loads(message)
     
-    for _ in range(iterations):
-        # Simulate a Random Walk with same volatility
-        rw_noise = np.random.choice(returns, size=len(data)-1)
-        rw = np.cumsum(np.insert(rw_noise, 0, data[0]))
+    # Check if 'bids' or 'b' exists to avoid KeyError
+    # Binance Partial Depth streams use 'bids' and 'asks' 
+    # whereas Diff. Depth streams use 'b' and 'a'
+    try:
+        if 'bids' in data:
+            bid = float(data['bids'][0][0])
+            ask = float(data['asks'][0][0])
+        elif 'b' in data:
+            bid = float(data['b'][0][0])
+            ask = float(data['a'][0][0])
+        else:
+            return # Not a price message, skip
+
+        mid_price = (bid + ask) / 2
+        prices.append(mid_price)
         
-        # Fit Kernel to Random Walk
-        kr_rw = KernelReg(endog=rw, exog=t, var_type='c', bw=[0.5])
-        rw_smooth, _ = kr_rw.fit(t)
-        
-        if np.var(rw_smooth) >= observed_var:
-            count += 1
+        if len(prices) > LOOKBACK_SIZE:
+            prices.pop(0)
+            run_kernel_analysis(np.array(prices))
             
-    p_value = count / iterations
-    return p_value
+    except (IndexError, KeyError) as e:
+        print(f"Parsing error: {e}. Message received: {data}")
 
-p_val = is_significant(price, smoothed_price)
+def run_kernel_analysis(data_window):
+    t = np.arange(len(data_window))
+    
+    # 1. Kernel Smoothing
+    kr = KernelReg(endog=data_window, exog=t, var_type='c', bw=[BANDWIDTH])
+    smoothed_price, _ = kr.fit(t)
+    
+    # 2. Peak Detection
+    peaks, _ = find_peaks(smoothed_price, height=np.mean(smoothed_price))
+    
+    # 3. Quick Significance Check (Simplified for real-time speed)
+    # We compare the variance of the smooth curve vs the raw volatility
+    observed_var = np.var(smoothed_price)
+    raw_var = np.var(data_window)
+    signal_to_noise = observed_var / raw_var
+    
+    print(f"Instrument: {SYMBOL.upper()} | Peaks: {len(peaks)} | SNR: {signal_to_noise:.4f}")
+    
+    # Visualization (Note: In real-time, it's better to update a single plot 
+    # than opening new ones, but for logic testing, we use this):
+    if len(peaks) >= 2: # Potential Double Top/Bottom detected
+        plt.clf()
+        plt.plot(t, data_window, alpha=0.3, color='gray', label='Raw L2')
+        plt.plot(t, smoothed_price, color='blue', label='Kernel Smooth')
+        plt.scatter(t[peaks], smoothed_price[peaks], color='red', marker='x')
+        plt.title(f"Real-time {SYMBOL.upper()} Analysis")
+        plt.pause(0.01)
 
-# 5. Visualization
-plt.figure(figsize=(12, 6))
-plt.plot(t, price, label='Raw L2 Price (Noisy)', alpha=0.4, color='gray')
-plt.plot(t, smoothed_price, label='Kernel Smoothed Path', color='blue', linewidth=2)
-plt.plot(t[peaks], smoothed_price[peaks], "x", color='red', markersize=10, label='Detected Peaks')
-plt.title(f"Kernel Regression Pattern Detection (p-value: {p_val:.4f})")
-plt.legend()
-plt.show()
+def on_error(ws, error):
+    print(f"Error: {error}")
 
-if p_val < 0.05:
-    print("Result: Pattern is Statistically Significant (Not a Random Walk)")
-else:
-    print("Result: Pattern is likely Noise/Random Walk")
+def on_close(ws, close_status_code, close_msg):
+    print("### Stream Closed ###")
 
-    # At the very end of your script
-plt.show(block=True)
+# Start the WebSocket stream for L2 Data
+socket_url = f"wss://stream.binance.com:9443/ws/{SYMBOL}@depth5@100ms"
+ws = websocket.WebSocketApp(socket_url, 
+                            on_message=on_message, 
+                            on_error=on_error, 
+                            on_close=on_close)
+
+print(f"Connecting to live L2 feed for {SYMBOL}...")
+ws.run_forever()
