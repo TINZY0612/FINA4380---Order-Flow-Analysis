@@ -1,0 +1,60 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from statsmodels.nonparametric.kernel_regression import KernelReg
+from scipy.signal import find_peaks
+
+# 1. Generate Synthetic Data (A "Double Top" buried in noise)
+np.random.seed(42)
+t = np.linspace(0, 10, 100)
+# Underlying pattern: two peaks
+pattern = -(t-2.5)**2 + 10 + -(t-7.5)**2 + 10 
+noise = np.random.normal(0, 2, 100)
+price = pattern + noise
+
+# 2. Apply Kernel Regression (Nadaraya-Watson)
+# 'c' indicates a continuous variable; bw is the bandwidth (smoothing parameter)
+kr = KernelReg(endog=price, exog=t, var_type='c', bw=[0.5])
+smoothed_price, _ = kr.fit(t)
+
+# 3. Pattern Identification (Finding Peaks on the smoothed curve)
+peaks, _ = find_peaks(smoothed_price, height=np.mean(smoothed_price))
+
+# 4. Statistical Significance (Simplified Monte Carlo)
+def is_significant(data, smoothed, iterations=1000):
+    observed_var = np.var(smoothed)
+    count = 0
+    returns = np.diff(data)
+    
+    for _ in range(iterations):
+        # Simulate a Random Walk with same volatility
+        rw_noise = np.random.choice(returns, size=len(data)-1)
+        rw = np.cumsum(np.insert(rw_noise, 0, data[0]))
+        
+        # Fit Kernel to Random Walk
+        kr_rw = KernelReg(endog=rw, exog=t, var_type='c', bw=[0.5])
+        rw_smooth, _ = kr_rw.fit(t)
+        
+        if np.var(rw_smooth) >= observed_var:
+            count += 1
+            
+    p_value = count / iterations
+    return p_value
+
+p_val = is_significant(price, smoothed_price)
+
+# 5. Visualization
+plt.figure(figsize=(12, 6))
+plt.plot(t, price, label='Raw L2 Price (Noisy)', alpha=0.4, color='gray')
+plt.plot(t, smoothed_price, label='Kernel Smoothed Path', color='blue', linewidth=2)
+plt.plot(t[peaks], smoothed_price[peaks], "x", color='red', markersize=10, label='Detected Peaks')
+plt.title(f"Kernel Regression Pattern Detection (p-value: {p_val:.4f})")
+plt.legend()
+plt.show()
+
+if p_val < 0.05:
+    print("Result: Pattern is Statistically Significant (Not a Random Walk)")
+else:
+    print("Result: Pattern is likely Noise/Random Walk")
+
+    # At the very end of your script
+plt.show(block=True)
