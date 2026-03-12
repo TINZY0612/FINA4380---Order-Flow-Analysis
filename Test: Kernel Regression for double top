@@ -6,79 +6,117 @@ import json
 import websocket
 
 # --- CONFIGURATION ---
-SYMBOL = "solusdt"
-LOOKBACK_SIZE = 120 
-HISTORY_SIZE = 800  # Total history shown in the bottom graph
-SIMULATIONS = 40    # Adjusted for smoother UI performance
-BANDWIDTH_DEFAULT = 0.6
+SYMBOL = "btcusdt"
+LOOKBACK_SIZE = 150 
+HISTORY_SIZE = 1000  
+SIMULATIONS = 40    # Monte Carlo iterations
 
-prices = []
-price_history = []
+# --- SIMULATION STATE ---
+balance = 1000.0  
+position = 0      
+entry_price = 0
+prices, price_history = [], []
 
-# Initialize a single figure with two subplots
+# Initialize UI
 plt.ion()
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'height_ratios': [2, 1]})
 fig.tight_layout(pad=4.0)
 
-def check_significance(raw_data, observed_smooth_var):
+def get_adaptive_bw(data):
+    """Calculates optimal bandwidth using Silverman's Rule: h = 1.06 * std * n^-1/5"""
+    std_dev = np.std(data)
+    n = len(data)
+    if std_dev == 0: return 0.5
+    return 1.06 * std_dev * (n**(-0.2))
+
+def detect_patterns(peaks, troughs, smoothed):
+    """Structural pattern recognition for BTC."""
+    if len(troughs) >= 2:
+        # Double Bottom
+        t1, t2 = troughs[-2], troughs[-1]
+        if abs(smoothed[t1] - smoothed[t2]) / smoothed[t1] < 0.0004:
+            return "DOUBLE_BOTTOM"
+
+    if len(peaks) >= 2:
+        # Double Top
+        p1, p2 = peaks[-2], peaks[-1]
+        if abs(smoothed[p1] - smoothed[p2]) / smoothed[p1] < 0.0004:
+            return "DOUBLE_TOP"
+
+    if len(troughs) >= 3:
+        # Inverse Head and Shoulders
+        if smoothed[troughs[-2]] < smoothed[troughs[-3]] and smoothed[troughs[-2]] < smoothed[troughs[-1]]:
+            return "INV_H&S"
+    return None
+
+def check_significance(raw_data, observed_var, bw):
+    """Permutation Test: Compares signal variance vs shuffled noise variance."""
     count = 0
     returns = np.diff(raw_data)
     t_sim = np.arange(len(raw_data))
-    
-    # Using a slightly faster permutation loop
     for _ in range(SIMULATIONS):
-        shuffled_returns = np.random.permutation(returns)
-        rw = np.cumsum(np.insert(shuffled_returns, 0, raw_data[0]))
-        
-        kr_sim = KernelReg(endog=rw, exog=t_sim, var_type='c', bw=[BANDWIDTH_DEFAULT])
+        shuffled = np.random.permutation(returns)
+        rw = np.cumsum(np.insert(shuffled, 0, raw_data[0]))
+        kr_sim = KernelReg(endog=rw, exog=t_sim, var_type='c', bw=[bw])
         smoothed_rw, _ = kr_sim.fit(t_sim)
-        
-        if np.var(smoothed_rw) >= observed_smooth_var:
+        if np.var(smoothed_rw) >= observed_var:
             count += 1
-            
     return (1 - (count / SIMULATIONS)) * 100
 
 def run_analysis(data_window, full_history):
+    global balance, position, entry_price
     t = np.arange(len(data_window))
+    current_p = data_window[-1]
     
-    # 1. Kernel Regression
-    kr = KernelReg(endog=data_window, exog=t, var_type='c', bw=[BANDWIDTH_DEFAULT])
+    # 1. Adaptive Bandwidth & Kernel Fit
+    bw = get_adaptive_bw(data_window)
+    kr = KernelReg(endog=data_window, exog=t, var_type='c', bw=[bw])
     smoothed_price, _ = kr.fit(t)
     
-    # 2. Significance Testing
+    # 2. Statistical Significance
     obs_var = np.var(smoothed_price)
-    conf_score = check_significance(data_window, obs_var)
+    conf_score = check_significance(data_window, obs_var, bw)
     
-    # 3. Peak Detection
-    peaks, _ = find_peaks(smoothed_price)
-    troughs, _ = find_peaks(-smoothed_price)
+    # 3. Peak/Pattern Detection
+    peaks, _ = find_peaks(smoothed_price, distance=15)
+    troughs, _ = find_peaks(-smoothed_price, distance=15)
+    pattern = detect_patterns(peaks, troughs, smoothed_price)
+    
+    is_sig = conf_score > 92
+    msg = ""
 
-    # --- TOP GRAPH: KERNEL & PATTERNS ---
+    # --- TRADING EXECUTION ---
+    if is_sig and (pattern in ["DOUBLE_BOTTOM", "INV_H&S"]):
+        if position == 0:
+            position = balance / current_p
+            balance = 0
+            entry_price = current_p
+            msg = f">>> BTC BUY ({pattern}) @ {current_p:.2f}"
+    elif is_sig and (pattern == "DOUBLE_TOP" or (len(peaks) > 0 and peaks[-1] > LOOKBACK_SIZE-10)):
+        if position > 0:
+            balance = position * current_p
+            pnl = ((current_p - entry_price) / entry_price) * 100
+            msg = f"<<< BTC SELL @ {current_p:.2f} | PnL: {pnl:.2f}%"
+            position = 0
+    if msg: print(msg)
+
+    # --- PLOTTING ---
     ax1.clear()
-    ax1.plot(t, data_window, alpha=0.3, color='gray', label='Raw Micro-price')
-    ax1.plot(t, smoothed_price, color='blue', linewidth=2, label='Kernel Trend')
-    
-    # Status Overlay
-    status_color = 'green' if conf_score > 90 else 'red'
-    status_text = "SIGNIFICANT" if conf_score > 90 else "RANDOM WALK"
-    ax1.set_title(f"Kernel Micro-structure: {SYMBOL.upper()} | {status_text} ({conf_score:.1f}%)", color=status_color, fontweight='bold')
-    
-    if len(peaks) > 0: ax1.scatter(t[peaks], smoothed_price[peaks], color='red', marker='v', s=100)
-    if len(troughs) > 0: ax1.scatter(t[troughs], smoothed_price[troughs], color='green', marker='^', s=100)
-    ax1.legend(loc='upper left')
-    ax1.grid(True, alpha=0.1)
+    ax1.plot(t, data_window, alpha=0.2, color='gray', label='Raw Micro-price')
+    ax1.plot(t, smoothed_price, color='orange', linewidth=2, label='Adaptive Kernel')
+    ax1.set_title(f"BTC/USDT Micro-structure | {pattern if pattern else 'No Pattern'} | Conf: {conf_score:.1f}%")
+    ax1.set_ylabel("Price (USD)")
+    ax1.set_xlabel("Lookback Ticks (100ms)")
+    if len(peaks) > 0: ax1.scatter(t[peaks], smoothed_price[peaks], color='red', marker='v', s=80)
+    if len(troughs) > 0: ax1.scatter(t[troughs], smoothed_price[troughs], color='green', marker='^', s=80)
 
-    # --- BOTTOM GRAPH: FULL HISTORY ---
     ax2.clear()
     ax2.plot(full_history, color='black', linewidth=1)
-    ax2.set_title(f"Live Price History ({len(full_history)} ticks)")
-    ax2.set_ylabel("Price")
-    ax2.grid(True, alpha=0.1)
-
-    # Output to Terminal
-    if conf_score > 90:
-        print(f"[!] {SYMBOL.upper()} SIGNIFICANT - Pattern Detected")
-
+    current_val = balance if position == 0 else position * current_p
+    ax2.set_title(f"Wallet Balance: ${current_val:.2f}")
+    ax2.set_ylabel("History Price")
+    ax2.set_xlabel("Total Ticks")
+    
     plt.draw()
     plt.pause(0.01)
 
@@ -86,28 +124,21 @@ def on_message(ws, message):
     global prices, price_history
     data = json.loads(message)
     try:
-        b = data.get('bids') or data.get('b')
-        a = data.get('asks') or data.get('a')
+        b, a = data.get('bids') or data.get('b'), data.get('asks') or data.get('a')
         if b and a:
-            bp, bv = float(b[0][0]), float(b[0][1])
-            ap, av = float(a[0][0]), float(a[0][1])
-            
-            # Weighted Micro-price
+            bp, bv, ap, av = float(b[0][0]), float(b[0][1]), float(a[0][0]), float(a[0][1])
+            # Micro-price formula
             mp = (bp * av + ap * bv) / (bv + av)
-            prices.append(mp)
-            price_history.append(mp)
-            
+            prices.append(mp); price_history.append(mp)
             if len(prices) > LOOKBACK_SIZE: prices.pop(0)
             if len(price_history) > HISTORY_SIZE: price_history.pop(0)
-            
             if len(prices) == LOOKBACK_SIZE:
                 run_analysis(np.array(prices), price_history)
-    except Exception:
-        pass
+    except Exception: pass
 
-# Start the Stream
+# Start Stream
 ws = websocket.WebSocketApp(f"wss://stream.binance.com:9443/ws/{SYMBOL}@depth5@100ms", on_message=on_message)
-print(f"Connecting to {SYMBOL.upper()}... Visualizing on dual subplots.")
+print(f"Starting BTC Adaptive Strategy... Monitoring {SYMBOL.upper()}")
 ws.run_forever()
 
 
