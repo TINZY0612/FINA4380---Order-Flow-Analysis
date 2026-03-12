@@ -8,98 +8,104 @@ import websocket
 # --- CONFIGURATION ---
 SYMBOL = "solusdt"
 LOOKBACK_SIZE = 120 
-BANDWIDTH = 0.6     
-SIMULATIONS = 100  # Decrease to 50 if your CPU is lagging
+HISTORY_SIZE = 800  # Total history shown in the bottom graph
+SIMULATIONS = 40    # Adjusted for smoother UI performance
+BANDWIDTH_DEFAULT = 0.6
 
 prices = []
+price_history = []
+
+# Initialize a single figure with two subplots
+plt.ion()
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'height_ratios': [2, 1]})
+fig.tight_layout(pad=4.0)
 
 def check_significance(raw_data, observed_smooth_var):
-    """
-    Monte Carlo Permutation Test:
-    Shuffles returns to see if a random walk could produce the same signal strength.
-    """
     count = 0
     returns = np.diff(raw_data)
     t_sim = np.arange(len(raw_data))
     
+    # Using a slightly faster permutation loop
     for _ in range(SIMULATIONS):
-        # Generate Random Walk from shuffled returns
         shuffled_returns = np.random.permutation(returns)
         rw = np.cumsum(np.insert(shuffled_returns, 0, raw_data[0]))
         
-        # Smooth the Random Walk
-        kr_sim = KernelReg(endog=rw, exog=t_sim, var_type='c', bw=[BANDWIDTH])
+        kr_sim = KernelReg(endog=rw, exog=t_sim, var_type='c', bw=[BANDWIDTH_DEFAULT])
         smoothed_rw, _ = kr_sim.fit(t_sim)
         
         if np.var(smoothed_rw) >= observed_smooth_var:
             count += 1
-    
-    p_value = count / SIMULATIONS
-    confidence = (1 - p_value) * 100
-    return confidence
+            
+    return (1 - (count / SIMULATIONS)) * 100
 
-def run_kernel_analysis(data_window):
+def run_analysis(data_window, full_history):
     t = np.arange(len(data_window))
     
-    # 1. Fit Kernel to Real Data
-    kr = KernelReg(endog=data_window, exog=t, var_type='c', bw=[BANDWIDTH])
+    # 1. Kernel Regression
+    kr = KernelReg(endog=data_window, exog=t, var_type='c', bw=[BANDWIDTH_DEFAULT])
     smoothed_price, _ = kr.fit(t)
     
-    # 2. Calculate observed signal strength (Variance)
-    observed_var = np.var(smoothed_price)
+    # 2. Significance Testing
+    obs_var = np.var(smoothed_price)
+    conf_score = check_significance(data_window, obs_var)
     
-    # 3. Determine Significance
-    conf_score = check_significance(data_window, observed_var)
-    
-    # --- PRINT MESSAGE LOGIC ---
-    if conf_score > 90:
-        print(f"[!] {SYMBOL.upper()} - SIGNIFICANT Pattern (Confidence: {conf_score:.1f}%)")
-    else:
-        print(f"[-] {SYMBOL.upper()} - Random Walk / Noise (Confidence: {conf_score:.1f}%)")
-    
-    # 4. Pattern Detection
+    # 3. Peak Detection
     peaks, _ = find_peaks(smoothed_price)
     troughs, _ = find_peaks(-smoothed_price)
+
+    # --- TOP GRAPH: KERNEL & PATTERNS ---
+    ax1.clear()
+    ax1.plot(t, data_window, alpha=0.3, color='gray', label='Raw Micro-price')
+    ax1.plot(t, smoothed_price, color='blue', linewidth=2, label='Kernel Trend')
     
-    # 5. Visuals
-    plt.clf()
-    plt.plot(t, data_window, alpha=0.3, color='gray', label='Raw Micro-price')
-    plt.plot(t, smoothed_price, color='blue', linewidth=2, label='Kernel Signal')
+    # Status Overlay
+    status_color = 'green' if conf_score > 90 else 'red'
+    status_text = "SIGNIFICANT" if conf_score > 90 else "RANDOM WALK"
+    ax1.set_title(f"Kernel Micro-structure: {SYMBOL.upper()} | {status_text} ({conf_score:.1f}%)", color=status_color, fontweight='bold')
     
-    # Text Box for Significance
-    color = 'green' if conf_score > 90 else 'red'
-    status = "SIGNIFICANT" if conf_score > 90 else "NOISE/RANDOM"
-    plt.text(5, np.max(data_window), f"Conf: {conf_score:.1f}% ({status})", 
-             bbox=dict(facecolor=color, alpha=0.5), fontsize=10)
-    
-    if len(peaks) > 0: plt.scatter(t[peaks], smoothed_price[peaks], color='red', marker='v')
-    if len(troughs) > 0: plt.scatter(t[troughs], smoothed_price[troughs], color='green', marker='^')
-    
-    plt.title(f"L2 Micro-price Analysis: {SYMBOL.upper()}")
+    if len(peaks) > 0: ax1.scatter(t[peaks], smoothed_price[peaks], color='red', marker='v', s=100)
+    if len(troughs) > 0: ax1.scatter(t[troughs], smoothed_price[troughs], color='green', marker='^', s=100)
+    ax1.legend(loc='upper left')
+    ax1.grid(True, alpha=0.1)
+
+    # --- BOTTOM GRAPH: FULL HISTORY ---
+    ax2.clear()
+    ax2.plot(full_history, color='black', linewidth=1)
+    ax2.set_title(f"Live Price History ({len(full_history)} ticks)")
+    ax2.set_ylabel("Price")
+    ax2.grid(True, alpha=0.1)
+
+    # Output to Terminal
+    if conf_score > 90:
+        print(f"[!] {SYMBOL.upper()} SIGNIFICANT - Pattern Detected")
+
+    plt.draw()
     plt.pause(0.01)
 
 def on_message(ws, message):
-    global prices
+    global prices, price_history
     data = json.loads(message)
     try:
-        # Standardize for Binance snapshot vs stream keys
         b = data.get('bids') or data.get('b')
         a = data.get('asks') or data.get('a')
         if b and a:
             bp, bv = float(b[0][0]), float(b[0][1])
             ap, av = float(a[0][0]), float(a[0][1])
             
-            # Micro-price calculation (incorporating OBI)
+            # Weighted Micro-price
             mp = (bp * av + ap * bv) / (bv + av)
             prices.append(mp)
+            price_history.append(mp)
             
-            if len(prices) > LOOKBACK_SIZE:
-                prices.pop(0)
-                run_kernel_analysis(np.array(prices))
-    except Exception as e:
+            if len(prices) > LOOKBACK_SIZE: prices.pop(0)
+            if len(price_history) > HISTORY_SIZE: price_history.pop(0)
+            
+            if len(prices) == LOOKBACK_SIZE:
+                run_analysis(np.array(prices), price_history)
+    except Exception:
         pass
 
-# Start
-plt.ion()
+# Start the Stream
 ws = websocket.WebSocketApp(f"wss://stream.binance.com:9443/ws/{SYMBOL}@depth5@100ms", on_message=on_message)
+print(f"Connecting to {SYMBOL.upper()}... Visualizing on dual subplots.")
 ws.run_forever()
