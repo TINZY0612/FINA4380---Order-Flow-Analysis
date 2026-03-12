@@ -1,0 +1,196 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from statsmodels.nonparametric.kernel_regression import KernelReg
+from scipy.signal import find_peaks
+import json
+import websocket
+
+# --- CONFIGURATION ---
+SYMBOL = "btcusdt"
+LOOKBACK_SIZE = 150 
+HISTORY_SIZE = 1000  
+SIMULATIONS = 40    # Monte Carlo iterations
+
+# --- SIMULATION STATE ---
+balance = 1000.0  
+position = 0      
+entry_price = 0
+prices, price_history = [], []
+
+# Initialize UI
+plt.ion()
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'height_ratios': [2, 1]})
+fig.tight_layout(pad=4.0)
+
+def get_adaptive_bw(data):
+    """Calculates optimal bandwidth using Silverman's Rule: h = 1.06 * std * n^-1/5"""
+    std_dev = np.std(data)
+    n = len(data)
+    if std_dev == 0: return 0.5
+    return 1.06 * std_dev * (n**(-0.2))
+
+def detect_patterns(peaks, troughs, smoothed):
+    """Structural pattern recognition for BTC."""
+    if len(troughs) >= 2:
+        # Double Bottom
+        t1, t2 = troughs[-2], troughs[-1]
+        if abs(smoothed[t1] - smoothed[t2]) / smoothed[t1] < 0.0004:
+            return "DOUBLE_BOTTOM"
+
+    if len(peaks) >= 2:
+        # Double Top
+        p1, p2 = peaks[-2], peaks[-1]
+        if abs(smoothed[p1] - smoothed[p2]) / smoothed[p1] < 0.0004:
+            return "DOUBLE_TOP"
+
+    if len(troughs) >= 3:
+        # Inverse Head and Shoulders
+        if smoothed[troughs[-2]] < smoothed[troughs[-3]] and smoothed[troughs[-2]] < smoothed[troughs[-1]]:
+            return "INV_H&S"
+    return None
+
+def check_significance(raw_data, observed_var, bw):
+    """Permutation Test: Compares signal variance vs shuffled noise variance."""
+    count = 0
+    returns = np.diff(raw_data)
+    t_sim = np.arange(len(raw_data))
+    for _ in range(SIMULATIONS):
+        shuffled = np.random.permutation(returns)
+        rw = np.cumsum(np.insert(shuffled, 0, raw_data[0]))
+        kr_sim = KernelReg(endog=rw, exog=t_sim, var_type='c', bw=[bw])
+        smoothed_rw, _ = kr_sim.fit(t_sim)
+        if np.var(smoothed_rw) >= observed_var:
+            count += 1
+    return (1 - (count / SIMULATIONS)) * 100
+
+def run_analysis(data_window, full_history):
+    global balance, position, entry_price
+    t = np.arange(len(data_window))
+    current_p = data_window[-1]
+    
+    # 1. Adaptive Bandwidth & Kernel Fit
+    bw = get_adaptive_bw(data_window)
+    kr = KernelReg(endog=data_window, exog=t, var_type='c', bw=[bw])
+    smoothed_price, _ = kr.fit(t)
+    
+    # 2. Statistical Significance
+    obs_var = np.var(smoothed_price)
+    conf_score = check_significance(data_window, obs_var, bw)
+    
+    # 3. Peak/Pattern Detection
+    peaks, _ = find_peaks(smoothed_price, distance=15)
+    troughs, _ = find_peaks(-smoothed_price, distance=15)
+    pattern = detect_patterns(peaks, troughs, smoothed_price)
+    
+    is_sig = conf_score > 92
+    msg = ""
+
+    # --- TRADING EXECUTION ---
+    if is_sig and (pattern in ["DOUBLE_BOTTOM", "INV_H&S"]):
+        if position == 0:
+            position = balance / current_p
+            balance = 0
+            entry_price = current_p
+            msg = f">>> BTC BUY ({pattern}) @ {current_p:.2f}"
+    elif is_sig and (pattern == "DOUBLE_TOP" or (len(peaks) > 0 and peaks[-1] > LOOKBACK_SIZE-10)):
+        if position > 0:
+            balance = position * current_p
+            pnl = ((current_p - entry_price) / entry_price) * 100
+            msg = f"<<< BTC SELL @ {current_p:.2f} | PnL: {pnl:.2f}%"
+            position = 0
+    if msg: print(msg)
+
+    # --- PLOTTING ---
+    ax1.clear()
+    ax1.plot(t, data_window, alpha=0.2, color='gray', label='Raw Micro-price')
+    ax1.plot(t, smoothed_price, color='orange', linewidth=2, label='Adaptive Kernel')
+    ax1.set_title(f"BTC/USDT Micro-structure | {pattern if pattern else 'No Pattern'} | Conf: {conf_score:.1f}%")
+    ax1.set_ylabel("Price (USD)")
+    ax1.set_xlabel("Lookback Ticks (100ms)")
+    if len(peaks) > 0: ax1.scatter(t[peaks], smoothed_price[peaks], color='red', marker='v', s=80)
+    if len(troughs) > 0: ax1.scatter(t[troughs], smoothed_price[troughs], color='green', marker='^', s=80)
+
+    ax2.clear()
+    ax2.plot(full_history, color='black', linewidth=1)
+    current_val = balance if position == 0 else position * current_p
+    ax2.set_title(f"Wallet Balance: ${current_val:.2f}")
+    ax2.set_ylabel("History Price")
+    ax2.set_xlabel("Total Ticks")
+    
+    plt.draw()
+    plt.pause(0.01)
+
+def on_message(ws, message):
+    global prices, price_history
+    data = json.loads(message)
+    try:
+        b, a = data.get('bids') or data.get('b'), data.get('asks') or data.get('a')
+        if b and a:
+            bp, bv, ap, av = float(b[0][0]), float(b[0][1]), float(a[0][0]), float(a[0][1])
+            # Micro-price formula
+            mp = (bp * av + ap * bv) / (bv + av)
+            prices.append(mp); price_history.append(mp)
+            if len(prices) > LOOKBACK_SIZE: prices.pop(0)
+            if len(price_history) > HISTORY_SIZE: price_history.pop(0)
+            if len(prices) == LOOKBACK_SIZE:
+                run_analysis(np.array(prices), price_history)
+    except Exception: pass
+
+# Start Stream
+ws = websocket.WebSocketApp(f"wss://stream.binance.com:9443/ws/{SYMBOL}@depth5@100ms", on_message=on_message)
+print(f"Starting BTC Adaptive Strategy... Monitoring {SYMBOL.upper()}")
+ws.run_forever()
+
+
+
+
+
+#Gemini said
+The code uses a Monte Carlo Permutation Test to determine the confidence level.
+
+In quantitative finance, this is a "non-parametric" way to figure out if the patterns you see (like a Double Top or a specific trend) are actually part of the market's intent or just a mathematical fluke caused by random price flickering.
+
+Here is the step-by-step breakdown of how the check_significance function in your code works:
+
+1. Defining the Null Hypothesis (The "Random Walk")
+The code assumes a Null Hypothesis (H 
+0
+​
+ ): The price movement is a Random Walk with no memory or intent. To simulate this, the code takes the real price returns from your lookback window and shuffles them randomly.
+
+Shuffling destroys the order (the pattern) but keeps the volatility (the variance) exactly the same.
+
+2. Signal Extraction (Kernel Variance)
+The code calculates the Variance of the smoothed "Kernel" line.
+
+High Variance in the smoothed line means there is a strong, clear trend or a distinct structural shape.
+
+Low Variance means the line is mostly flat or jittering aimlessly.
+
+3. The Monte Carlo Simulations
+The code runs the SIMULATIONS loop (set to 40 or 100 in your script):
+
+It creates a "fake" price series by cumulatively summing the shuffled returns.
+
+It applies the exact same Kernel Regression to this fake series.
+
+It measures the variance of this fake, random smoothed line.
+
+4. Calculating the p-value and Confidence
+The code compares the Real Variance to the Fake Variances.
+
+The Logic: If the real market's pattern produces a smoothed line that is "curvier" or "stronger" than 95% of the random shuffles, then the pattern is statistically significant.
+
+The Formula:
+
+Confidence=(1− 
+Total Simulations
+Count of Random Outcomes ≥ Real Outcome
+​
+ )×100
+Why this is better than standard indicators
+Most retail indicators (like RSI or MACD) don't tell you if the signal is "real" or just noise. By using the Permutation Test, your code effectively asks: "Could a coin flip have generated this chart pattern?" If the answer is "Yes" (Low Confidence), the strategy ignores the signal, saving you from "false breakouts."
+
+Since you're looking at BTC, which has very high "tick-velocity," this method is essential to filter out the noise generated by small HFT scalp bots.
+
+Would you like me to show you how to adjust the Confidence Threshold (currently 92%) based on the current market volatility?
