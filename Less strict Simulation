@@ -1,0 +1,158 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from statsmodels.nonparametric.kernel_regression import KernelReg
+from scipy.signal import find_peaks
+import json
+import websocket
+import time
+import sys
+
+# --- CONFIGURATION ---
+SYMBOL = "btcusdt"
+LOOKBACK_SIZE = 150 
+HISTORY_SIZE = 1000  
+SIMULATIONS = 30     
+OFI_THRESHOLD = 0.05  # Loosened for more active trading
+STOP_LOSS = 0.0015    
+TAKE_PROFIT = 0.0040  
+
+# --- STATE ---
+balance = 100000.0  
+position = 0      
+entry_price = 0
+prices, price_history = [], []
+ofi_buffer = []
+
+total_trades, wins = 0, 0
+gross_profit, gross_loss = 0.0, 0.0
+prev_bid_v, prev_ask_v = 0.0, 0.0
+
+# Initialize UI
+plt.ion()
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'height_ratios': [2, 1]})
+fig.tight_layout(pad=4.5)
+
+def get_ofi(bp, bv, ap, av):
+    global prev_bid_v, prev_ask_v
+    ofi = (bv - prev_bid_v) - (av - prev_ask_v)
+    prev_bid_v, prev_ask_v = bv, av
+    return ofi / (bv + av) if (bv + av) > 0 else 0
+
+def check_significance(raw_data, observed_var, bw):
+    count = 0
+    returns = np.diff(raw_data)
+    t_sim = np.arange(len(raw_data), dtype=np.float64)
+    for _ in range(SIMULATIONS):
+        shuffled = np.random.permutation(returns)
+        rw = np.cumsum(np.insert(shuffled, 0, raw_data[0]))
+        kr_sim = KernelReg(endog=rw, exog=t_sim, var_type='c', bw=[bw])
+        smoothed_rw, _ = kr_sim.fit(t_sim)
+        if np.var(smoothed_rw) >= observed_var:
+            count += 1
+    return (1 - (count / SIMULATIONS)) * 100
+
+def detect_patterns(peaks, troughs, smoothed):
+    if len(troughs) >= 2:
+        t1, t2 = troughs[-2], troughs[-1]
+        # Tolerance increased to 0.1% for more matches
+        if abs(smoothed[t1] - smoothed[t2]) / smoothed[t1] < 0.001:
+            return "DOUBLE_BOTTOM"
+    if len(peaks) >= 2:
+        p1, p2 = peaks[-2], peaks[-1]
+        if abs(smoothed[p1] - smoothed[p2]) / smoothed[p1] < 0.001:
+            return "DOUBLE_TOP"
+    return None
+
+def run_analysis(data_window, ofi_avg):
+    global balance, position, entry_price, total_trades, wins, gross_profit, gross_loss
+    t = np.arange(len(data_window), dtype=np.float64)
+    current_p = data_window[-1]
+    
+    std_dev = np.std(data_window)
+    bw = 1.06 * std_dev * (len(data_window)**(-0.2)) if std_dev > 0 else 0.5
+    kr = KernelReg(endog=data_window, exog=t, var_type='c', bw=[bw])
+    smoothed, _ = kr.fit(t)
+    
+    obs_var = np.var(smoothed)
+    conf_score = check_significance(data_window, obs_var, bw)
+    peaks, _ = find_peaks(smoothed, distance=10)
+    troughs, _ = find_peaks(-smoothed, distance=10)
+    pattern = detect_patterns(peaks, troughs, smoothed)
+
+    # --- TRADING LOGIC ---
+    is_sig = conf_score > 80 # Lowered threshold for activity
+    
+    if pattern == "DOUBLE_BOTTOM":
+        sys.stdout.write(f"\r[DEBUG] Found {pattern} | Conf: {conf_score:.1f}% | OFI: {ofi_avg:.3f}")
+        sys.stdout.flush()
+
+    if position == 0 and is_sig:
+        if pattern == "DOUBLE_BOTTOM" and ofi_avg > OFI_THRESHOLD:
+            position = balance / current_p
+            balance, entry_price = 0, current_p
+            sys.stdout.write(f"\n[!!! BUY] @ {current_p:.2f} | Conf: {conf_score:.1f}% | OFI: {ofi_avg:.2f}")
+
+    elif position > 0:
+        pnl_pct = (current_p - entry_price) / entry_price
+        if pnl_pct <= -STOP_LOSS or pnl_pct >= TAKE_PROFIT or (is_sig and pattern == "DOUBLE_TOP"):
+            profit_amt = (current_p - entry_price) * position
+            balance = position * current_p
+            total_trades += 1
+            if profit_amt > 0:
+                wins += 1
+                gross_profit += profit_amt
+            else:
+                gross_loss += abs(profit_amt)
+            sys.stdout.write(f"\n[!!! EXIT] @ {current_p:.2f} | PnL: {pnl_pct*100:.2f}%")
+            position = 0
+
+    # --- UI UPDATE ---
+    ax1.clear()
+    ax1.plot(t, data_window, alpha=0.3, color='gray', label='Raw')
+    ax1.plot(t, smoothed, color='orange', linewidth=2, label='Kernel')
+    ax1.set_ylabel("Price (USD)")
+    ax1.set_xlabel("Ticks (100ms)")
+    ax1.set_title(f"BTC/USDT | Pattern: {pattern} | Conf: {conf_score:.1f}%")
+    
+    if len(peaks) > 0: ax1.scatter(t[peaks], smoothed[peaks], color='red', marker='v', s=80)
+    if len(troughs) > 0: ax1.scatter(t[troughs], smoothed[troughs], color='green', marker='^', s=80)
+    ax1.legend(loc='upper left', fontsize='small')
+
+    ax2.clear()
+    # Bottom Plot: Price Trend + Momentum Indicator
+    ax2.plot(price_history[-200:], color='black', alpha=0.5)
+    ax2.set_ylabel("Trend / Momentum")
+    
+    # Visual Momentum Bar
+    color = 'green' if ofi_avg > OFI_THRESHOLD else 'red' if ofi_avg < -OFI_THRESHOLD else 'gray'
+    ax2.bar(len(price_history[-200:])-1, ofi_avg * 1000, color=color, width=20, label='OFI Momentum')
+    
+    current_val = balance if position == 0 else position * current_p
+    wr = (wins / total_trades * 100) if total_trades > 0 else 0
+    ax2.set_title(f"Portfolio: ${current_val:.2f} | Win Rate: {wr:.1f}%")
+    
+    plt.draw()
+    plt.pause(0.001)
+
+def on_message(ws, message):
+    global prices, ofi_buffer
+    data = json.loads(message, parse_int=float)
+    if 'b' not in data and 'bids' not in data: return
+    try:
+        b, a = data.get('b') or data.get('bids'), data.get('a') or data.get('asks')
+        if not b or not a: return
+        bp, bv, ap, av = float(b[0][0]), float(b[0][1]), float(a[0][0]), float(a[0][1])
+        mp = (bp * av + ap * bv) / (bv + av)
+        prices.append(mp); price_history.append(mp)
+        ofi_buffer.append(get_ofi(bp, bv, ap, av))
+        if len(prices) > LOOKBACK_SIZE: prices.pop(0)
+        if len(ofi_buffer) > 50: ofi_buffer.pop(0)
+        if len(prices) == LOOKBACK_SIZE:
+            run_analysis(np.array(prices, dtype=np.float64), np.mean(ofi_buffer))
+    except: pass
+
+while True:
+    try:
+        ws = websocket.WebSocketApp(f"wss://stream.binance.com:9443/ws/{SYMBOL}@depth5@100ms", on_message=on_message)
+        ws.run_forever(ping_interval=20)
+    except: time.sleep(2)

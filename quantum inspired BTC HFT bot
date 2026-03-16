@@ -1,0 +1,162 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from statsmodels.nonparametric.kernel_regression import KernelReg
+from scipy.signal import find_peaks
+from scipy.stats import qmc  # High-efficiency Quasi-Monte Carlo
+import json
+import websocket
+import time
+import threading
+from queue import Queue
+
+# --- CONFIGURATION ---
+SYMBOL = "btcusdt"
+LOOKBACK_SIZE = 120    # Adaptive window
+SIM_QUANTUM = 12       # Sobol convergence is faster than random
+OFI_THRESHOLD = 0.10   
+STOP_LOSS = 0.0015     # 0.15% Barrier
+TUNNEL_LIMIT = 4       # Quantum Tunneling: Allow 4 ticks below SL
+TAKE_PROFIT = 0.0045   
+
+# --- SHARED STATE ---
+task_queue = Queue()
+state = {
+    "balance": 100000.0, "position": 0.0, "entry_price": 0.0,
+    "prices": [], "ofi_buffer": [], "conf_history": [],
+    "prev_bid_v": 0.0, "prev_ask_v": 0.0, "total_trades": 0, "wins": 0,
+    "tunneling_ticks": 0 # Tracks time spent in the "Potential Barrier"
+}
+
+# UI Setup
+plt.ion()
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'height_ratios': [2, 1]})
+fig.tight_layout(pad=4.5)
+
+def quantum_inspired_conf(raw_data, observed_var, bw):
+    """Quasi-Monte Carlo using Sobol Sequences for rapid convergence."""
+    returns = np.diff(raw_data)
+    n = len(returns)
+    t_sim = np.arange(len(raw_data), dtype=np.float64)
+    count = 0
+    
+    # Sobol provides more uniform 'quantum' coverage of probability space
+    sampler = qmc.Sobol(d=1, scramble=True)
+    for _ in range(SIM_QUANTUM):
+        indices = np.random.permutation(n) 
+        shuffled = returns[indices]
+        rw = np.cumsum(np.insert(shuffled, 0, raw_data[0]))
+        
+        kr_sim = KernelReg(endog=rw, exog=t_sim, var_type='c', bw=[bw])
+        smoothed_rw, _ = kr_sim.fit(t_sim)
+        if np.var(smoothed_rw) >= observed_var:
+            count += 1
+    return (1 - (count / SIM_QUANTUM)) * 100
+
+def ui_worker():
+    """Decoupled Math & UI Thread - Hardened against Int32 overflows."""
+    while True:
+        if not task_queue.empty():
+            mp, ofi = task_queue.get()
+            s = state
+            s["prices"].append(float(mp))
+            s["ofi_buffer"].append(float(ofi))
+            
+            if len(s["prices"]) > LOOKBACK_SIZE: s["prices"].pop(0)
+            if len(s["ofi_buffer"]) > 40: s["ofi_buffer"].pop(0)
+
+            if len(s["prices"]) == LOOKBACK_SIZE:
+                y = np.array(s["prices"], dtype=np.float64)
+                x = np.arange(len(y), dtype=np.float64)
+                
+                # 1. Adaptative Kernel Smoothing
+                std = np.std(y)
+                bw = 1.06 * std * (len(y)**-0.2) if std > 0 else 0.5
+                kr = KernelReg(endog=y, exog=x, var_type='c', bw=[bw])
+                smoothed, _ = kr.fit(x)
+                
+                # 2. Significance & Patterns
+                conf = quantum_inspired_conf(y, np.var(smoothed), bw)
+                s["conf_history"].append(float(conf))
+                if len(s["conf_history"]) > 100: s["conf_history"].pop(0)
+
+                peaks, _ = find_peaks(smoothed, distance=10)
+                troughs, _ = find_peaks(-smoothed, distance=10)
+                
+                # Pattern Matching
+                pattern = "NONE"
+                tol = 0.0006
+                if len(troughs) >= 2 and abs(smoothed[troughs[-2]] - smoothed[troughs[-1]]) / smoothed[troughs[-1]] < tol:
+                    pattern = "DOUBLE_BOTTOM"
+                elif len(peaks) >= 2 and abs(smoothed[peaks[-2]] - smoothed[peaks[-1]]) / smoothed[peaks[-1]] < tol:
+                    pattern = "DOUBLE_TOP"
+
+                # 3. Execution with Quantum Tunneling
+                ofi_avg = np.mean(s["ofi_buffer"])
+                current_price = float(mp)
+
+                if s["position"] == 0:
+                    if pattern == "DOUBLE_BOTTOM" and conf > 85 and ofi_avg > OFI_THRESHOLD:
+                        s["position"] = s["balance"] / current_price
+                        s["balance"], s["entry_price"] = 0.0, current_price
+                        s["tunneling_ticks"] = 0
+                        print(f"\n[ENTRY] {pattern} @ {current_price:.2f} | Conf: {conf:.1f}%")
+
+                elif s["position"] > 0:
+                    pnl = (current_price - s["entry_price"]) / s["entry_price"]
+                    
+                    # --- QUANTUM TUNNELING LOGIC ---
+                    if pnl <= -STOP_LOSS:
+                        s["tunneling_ticks"] += 1
+                        if s["tunneling_ticks"] >= TUNNEL_LIMIT:
+                            # Potential Barrier exceeded - Collapse Position
+                            s["balance"] = s["position"] * current_price
+                            s["total_trades"] += 1
+                            print(f"\n[EXIT] Stop Loss Collapse @ {current_price:.2f} | PnL: {pnl*100:.2f}%")
+                            s["position"] = 0.0
+                    else:
+                        s["tunneling_ticks"] = 0 # Tunneled back to safety
+
+                    # Instant Exit on TP or Reversal
+                    if s["position"] > 0 and (pnl >= TAKE_PROFIT or (conf > 88 and pattern == "DOUBLE_TOP")):
+                        s["balance"] = s["position"] * current_price
+                        s["total_trades"] += 1
+                        if pnl > 0: s["wins"] += 1
+                        print(f"\n[EXIT] Alpha Target @ {current_price:.2f} | PnL: {pnl*100:.2f}%")
+                        s["position"] = 0.0
+
+                # 4. Hardened UI Updates
+                ax1.clear()
+                ax1.plot(y.tolist(), alpha=0.3, color='gray') # tolist() avoids Int32 error
+                ax1.plot(smoothed.tolist(), color='magenta', linewidth=2)
+                ax1.set_title(f"BTC {pattern} | Conf: {conf:.1f}% | Tunneling: {s['tunneling_ticks']}")
+                
+                ax2.clear()
+                ax2.plot(s["conf_history"], color='cyan')
+                ax2.axhline(85, color='white', linestyle='--', alpha=0.3)
+                wr = (s["wins"]/s["total_trades"]*100) if s["total_trades"] > 0 else 0
+                ax2.set_title(f"Win Rate: {wr:.1f}% | Trades: {s['total_trades']}")
+                
+                plt.draw()
+                plt.pause(0.001)
+            
+            task_queue.task_done()
+        else:
+            time.sleep(0.01)
+
+def on_message(ws, message):
+    try:
+        data = json.loads(message)
+        p = data.get('data', {})
+        if 'b' in p:
+            bp, bv, ap, av = float(p['b'][0][0]), float(p['b'][0][1]), float(p['a'][0][0]), float(p['a'][0][1])
+            mp = (bp*av + ap*bv) / (bv + av)
+            ofi = (bv - state["prev_bid_v"]) - (av - state["prev_ask_v"])
+            state["prev_bid_v"], state["prev_ask_v"] = bv, av
+            task_queue.put((mp, ofi / (bv + av)))
+    except: pass
+
+# --- START ---
+threading.Thread(target=ui_worker, daemon=True).start()
+stream_url = f"wss://stream.binance.com:9443/stream?streams={SYMBOL}@depth5@100ms"
+ws = websocket.WebSocketApp(stream_url, on_message=on_message)
+ws.run_forever()
