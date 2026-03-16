@@ -1,0 +1,188 @@
+import matplotlib
+# Forces the window to pop out for VS Code stability
+matplotlib.use('TkAgg') 
+
+import numpy as np
+import matplotlib.pyplot as plt
+from statsmodels.nonparametric.kernel_regression import KernelReg
+from scipy.signal import find_peaks
+from scipy.stats import qmc  
+import json
+import websocket
+import time
+import threading
+from queue import Queue
+
+# --- CONFIGURATION ---
+SYMBOL = "btcusdt"
+LOOKBACK_SIZE = 120    
+SIM_QUANTUM = 12       
+
+# --- SHARED STATE ---
+task_queue = Queue()
+ui_queue = Queue()
+
+state = {
+    "prices": [], 
+    "conf_history": [],
+    "prev_bid_v": 0.0, 
+    "prev_ask_v": 0.0,
+    "tick_count": 0,
+    "last_update": time.time()
+}
+
+def quantum_inspired_conf(raw_data, observed_var, bw):
+    returns = np.diff(raw_data)
+    n = len(returns)
+    t_sim = np.arange(len(raw_data), dtype=np.float64)
+    count = 0
+    for _ in range(SIM_QUANTUM):
+        indices = np.random.permutation(n) 
+        shuffled = returns[indices]
+        rw = np.cumsum(np.insert(shuffled, 0, raw_data[0]))
+        try:
+            kr_sim = KernelReg(endog=rw, exog=t_sim, var_type='c', bw=[bw])
+            smoothed_rw, _ = kr_sim.fit(t_sim)
+            if np.var(smoothed_rw) >= observed_var:
+                count += 1
+        except: continue
+    return (1 - (count / SIM_QUANTUM)) * 100
+
+def math_worker():
+    print("Math Engine Initialized.")
+    while True:
+        if not task_queue.empty():
+            mp, ofi = task_queue.get()
+            s = state
+            s["prices"].append(float(mp))
+            
+            if len(s["prices"]) > LOOKBACK_SIZE: s["prices"].pop(0)
+
+            if len(s["prices"]) == LOOKBACK_SIZE:
+                y = np.array(s["prices"], dtype=np.float64)
+                x = np.arange(len(y), dtype=np.float64)
+                
+                std = np.std(y)
+                bw = 1.06 * std * (len(y)**-0.2) if std > 0 else 0.5
+                kr = KernelReg(endog=y, exog=x, var_type='c', bw=[bw])
+                smoothed, _ = kr.fit(x)
+                
+                conf = quantum_inspired_conf(y, np.var(smoothed), bw)
+                s["conf_history"].append(float(conf))
+                if len(s["conf_history"]) > 100: s["conf_history"].pop(0)
+
+                peaks, _ = find_peaks(smoothed, distance=15)
+                troughs, _ = find_peaks(-smoothed, distance=15)
+                pattern, markers = "NONE", []
+
+                # Pattern logic
+                if len(peaks) >= 2 and abs(smoothed[peaks[-2]] - smoothed[peaks[-1]]) / smoothed[peaks[-1]] < 0.0006:
+                    pattern, markers = "DOUBLE_TOP", peaks[-2:].tolist()
+                elif len(troughs) >= 2 and abs(smoothed[troughs[-2]] - smoothed[troughs[-1]]) / smoothed[troughs[-1]] < 0.0006:
+                    pattern, markers = "DOUBLE_BOTTOM", troughs[-2:].tolist()
+                elif len(peaks) >= 3:
+                    s1, head, s2 = smoothed[peaks[-3]], smoothed[peaks[-2]], smoothed[peaks[-1]]
+                    if head > s1 and head > s2 and abs(s1 - s2) / s2 < 0.0015:
+                        pattern, markers = "HEAD_SHOULDERS", peaks[-3:].tolist()
+                elif len(troughs) >= 3:
+                    ts1, thead, ts2 = smoothed[troughs[-3]], smoothed[troughs[-2]], smoothed[troughs[-1]]
+                    if thead < ts1 and thead < ts2 and abs(ts1 - ts2) / ts2 < 0.0015:
+                        pattern, markers = "INV_H_SHOULDERS", troughs[-3:].tolist()
+                
+                ui_queue.put({'y': y.tolist(), 'smoothed': smoothed.tolist(), 'conf': conf, 'pattern': pattern, 'markers': markers})
+            task_queue.task_done()
+        else:
+            time.sleep(0.01)
+
+def on_message(ws, message):
+    try:
+        raw_payload = json.loads(message)
+        
+        # 1. Handle Combined Stream Wrapper
+        # If 'data' exists, the real info is inside it.
+        data = raw_payload.get('data', raw_payload)
+        
+        # 2. Extract Bids and Asks
+        # Binance uses 'bids'/'asks' or 'b'/'a' depending on the specific endpoint
+        bids = data.get('bids', data.get('b', []))
+        asks = data.get('asks', data.get('a', []))
+
+        if len(bids) > 0 and len(asks) > 0:
+            state["tick_count"] += 1
+            
+            # Extract Best Bid (Price, Vol) and Best Ask (Price, Vol)
+            # Index [0] is always the best price in a depth stream
+            bp, bv = float(bids[0][0]), float(bids[0][1])
+            ap, av = float(asks[0][0]), float(asks[0][1])
+            
+            # Mid-price (Micro-price weighted by opposite volume)
+            mp = (bp * av + ap * bv) / (bv + av)
+            
+            # Update volume state and send to math worker
+            state["prev_bid_v"], state["prev_ask_v"] = bv, av
+            task_queue.put((mp, 0))
+            
+            # Console feedback every 10 ticks
+            if state["tick_count"] % 10 == 0:
+                print(f">>> Data Flowing: {state['tick_count']} ticks processed", end="\r")
+        else:
+            if state["tick_count"] == 0:
+                print("Warning: Received JSON but no bids/asks found. Check stream name.")
+
+    except Exception as e:
+        print(f"Parser Error: {e} | Message Snippet: {message[:100]}")
+
+if __name__ == "__main__":
+    threading.Thread(target=math_worker, daemon=True).start()
+    
+    stream_url = f"wss://stream.binance.com:9443/stream?streams={SYMBOL}@depth5@100ms"
+    ws = websocket.WebSocketApp(stream_url, on_message=on_message)
+    threading.Thread(target=ws.run_forever, daemon=True).start()
+
+    # --- UI SETUP ---
+    plt.style.use('dark_background')
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), gridspec_kw={'height_ratios': [2, 1]})
+    plt.ion()
+
+    print("Checking connection to Binance...")
+
+    while True:
+        if not ui_queue.empty():
+            data = ui_queue.get()
+            
+            ax1.clear()
+            ax1.plot(data['y'], alpha=0.3, color='gray', label='Raw')
+            ax1.plot(data['smoothed'], color='#00FF00', linewidth=2, label='Trend')
+            
+            # Status Indicator (Top Right)
+            status_text = f"SYSTEM: LIVE | Ticks: {state['tick_count']}"
+            ax1.text(0.98, 0.95, status_text, transform=ax1.transAxes, 
+                     color='lime', ha='right', va='top', fontweight='bold', bbox=dict(facecolor='black', alpha=0.5))
+
+            if data['pattern'] != "NONE":
+                mx, my = data['markers'], [data['smoothed'][i] for i in data['markers']]
+                color = '#FF4444' if 'TOP' in data['pattern'] or ('HEAD' in data['pattern'] and 'INV' not in data['pattern']) else '#4444FF'
+                ax1.scatter(mx, my, color=color, s=100, edgecolors='white', zorder=5)
+            
+            ax1.set_title(f"{SYMBOL.upper()} | {data['pattern']}", loc='left')
+            ax1.legend(loc='upper left', frameon=False)
+
+            ax2.clear()
+            ax2.plot(state["conf_history"], color='#00FFFF')
+            ax2.axhline(85, color='red', linestyle='--', alpha=0.5)
+            ax2.set_ylim(-5, 105)
+            ax2.set_ylabel("Confidence %")
+
+            plt.pause(0.01)
+        else:
+            # Warm-up phase indicator
+            if state["tick_count"] < LOOKBACK_SIZE:
+                ax1.clear()
+                ax1.text(0.5, 0.5, f"BUFFERING DATA: {state['tick_count']}/{LOOKBACK_SIZE}\nPLEASE WAIT...", 
+                         ha='center', va='center', transform=ax1.transAxes, color='yellow', fontsize=12)
+                plt.pause(0.2)
+            else:
+                plt.pause(0.1)
+        
+        fig.canvas.draw_idle()
+        fig.canvas.flush_events()
