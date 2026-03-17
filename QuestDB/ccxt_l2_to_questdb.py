@@ -23,7 +23,6 @@ import json
 import argparse
 import threading
 import ssl
-
 import websocket
 import requests
 
@@ -31,7 +30,7 @@ import requests
 # CONFIG
 # ==========================================
 L2_LEVELS = 20
-L2_DURATION_MINUTES = 5
+L2_DURATION_MINUTES = 1440
 TABLE_NAME = "l2_orderbook"
 L2_ILP_BATCH_SIZE = 500
 
@@ -45,7 +44,7 @@ SYMBOLS = [
     "DOGE/USDT",
     "AVAX/USDT",
     "DOT/USDT",
-    "MATIC/USDT",
+    "POL/USDT", 
 ]
 
 # Binance WebSocket (spot)
