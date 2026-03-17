@@ -1,0 +1,175 @@
+import matplotlib
+matplotlib.use('TkAgg') 
+
+import numpy as np
+import matplotlib.pyplot as plt
+from statsmodels.nonparametric.kernel_regression import KernelReg
+from scipy.signal import find_peaks
+from scipy.stats import qmc 
+import json
+import websocket
+import time
+import threading
+from queue import Queue
+
+# --- CONFIG ---
+SYMBOLS = ["btcusdt", "ethusdt", "solusdt"]
+LOOKBACK_SIZE = 120    
+SIM_QUANTUM = 12        
+CONF_THRESHOLD = 85.0
+
+task_queue = Queue()
+ui_queue = Queue()
+state = {s: {"prices": [], "ready": False} for s in SYMBOLS}
+
+# --- QUANTUM-INSPIRED MATH ---
+def quantum_inspired_conf(raw_data, observed_var, bw):
+    returns = np.diff(raw_data)
+    n = len(returns)
+    sampler = qmc.Sobol(d=n, scramble=True)
+    sobol_samples = sampler.random(n=SIM_QUANTUM)
+    count = 0
+    t_sim = np.arange(len(raw_data), dtype=np.float64)
+    for i in range(SIM_QUANTUM):
+        shuffled = returns[np.argsort(sobol_samples[i])]
+        rw = np.cumsum(np.insert(shuffled, 0, raw_data[0]))
+        try:
+            kr_sim = KernelReg(endog=rw, exog=t_sim, var_type='c', bw=[bw])
+            if np.var(kr_sim.fit(t_sim)[0]) >= observed_var: count += 1
+        except: continue
+    return (1 - (count / SIM_QUANTUM)) * 100
+
+def detect_patterns(peaks, valleys, y_smoothed):
+    """Identifies basic trend structures based on local extrema"""
+    if len(peaks) < 2 or len(valleys) < 2:
+        return "INITIALIZING"
+    
+    # Get last two confirmed peaks and valleys
+    p1, p2 = y_smoothed[peaks[-2]], y_smoothed[peaks[-1]]
+    v1, v2 = y_smoothed[valleys[-2]], y_smoothed[valleys[-1]]
+    
+    if p2 > p1 and v2 > v1: return "BULLISH CHANNEL"
+    if p2 < p1 and v2 < v1: return "BEARISH CHANNEL"
+    if p2 > p1 and v2 < v1: return "EXPANDING RANGE"
+    if p2 < p1 and v2 > v1: return "CONSOLIDATING"
+    return "NEUTRAL"
+
+def math_worker():
+    while True:
+        if not task_queue.empty():
+            symbol, mp = task_queue.get()
+            s = state[symbol]
+            s["prices"].append(mp)
+            if len(s["prices"]) > LOOKBACK_SIZE: s["prices"].pop(0)
+            
+            payload = {'symbol': symbol, 'y': list(s["prices"]), 'ready': False}
+            
+            if len(s["prices"]) == LOOKBACK_SIZE:
+                y, x = np.array(s["prices"]), np.arange(LOOKBACK_SIZE)
+                std = np.std(y)
+                bw = 1.06 * std * (LOOKBACK_SIZE**-0.2) if std > 0 else 0.5
+                try:
+                    kr = KernelReg(endog=y, exog=x, var_type='c', bw=[bw])
+                    smoothed, _ = kr.fit(x)
+                    conf = quantum_inspired_conf(y, np.var(smoothed), bw)
+                    
+                    # --- EXTREMA DETECTION (Local Peaks/Valleys) ---
+                    # distance=10 ensures we don't catch every tiny micro-wiggle
+                    peaks, _ = find_peaks(smoothed, distance=10)
+                    valleys, _ = find_peaks(-smoothed, distance=10)
+                    pattern = detect_patterns(peaks, valleys, smoothed)
+
+                    payload.update({
+                        'smoothed': smoothed.tolist(), 
+                        'conf': conf, 
+                        'peaks': peaks.tolist(),
+                        'valleys': valleys.tolist(),
+                        'pattern': pattern,
+                        'ready': True
+                    })
+                except: pass
+            
+            ui_queue.put(payload)
+            task_queue.task_done()
+        time.sleep(0.001)
+
+# --- CONNECTIVITY ENGINE ---
+def on_message(ws, message):
+    try:
+        raw = json.loads(message)
+        data = raw.get('data', raw)
+        symbol = raw.get('stream', data.get('s', '')).split('@')[0].lower()
+        if not symbol: return
+        price = float(data.get('p', data.get('b', [[0]])[0][0]))
+        if price > 0:
+            task_queue.put((symbol, price))
+    except: pass
+
+def run_ws():
+    # Force port 443 for stability
+    streams = "/".join([f"{s}@trade" for s in SYMBOLS])
+    url = f"wss://stream.binance.com:443/stream?streams={streams}"
+    print(f">>> CONNECTING TO BINANCE CLOUD...")
+    ws = websocket.WebSocketApp(url, on_message=on_message)
+    ws.run_forever()
+
+# --- UI ENGINE ---
+if __name__ == "__main__":
+    threading.Thread(target=math_worker, daemon=True).start()
+    threading.Thread(target=run_ws, daemon=True).start()
+
+    plt.style.use('dark_background')
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    plt.ion()
+    
+    print(">>> SYSTEM LIVE: Receiving real-time stream...")
+
+    while True:
+        if not ui_queue.empty():
+            data = ui_queue.get()
+            idx = SYMBOLS.index(data['symbol'])
+            ax = axes[idx]
+            ax.clear()
+            
+            y_vals = data['y']
+            ax.plot(y_vals, color='#444444', alpha=0.5, label='Raw Ticks')
+            
+            if data['ready']:
+                smoothed = np.array(data['smoothed'])
+                ax.plot(smoothed, color='#00FFCC', linewidth=2)
+                
+                # --- PLOT PEAKS ---
+                peaks = data['peaks']
+                for i, p in enumerate(peaks):
+                    label = 'H'
+                    if i > 0:
+                        label = 'HH' if smoothed[p] > smoothed[peaks[i-1]] else 'LH'
+                    
+                    ax.scatter(p, smoothed[p], color='#FF3366', marker='v', zorder=5)
+                    ax.annotate(label, (p, smoothed[p]), textcoords="offset points", 
+                                xytext=(0,10), ha='center', fontsize=8, color='#FF3366', fontweight='bold')
+                
+                # --- PLOT VALLEYS ---
+                valleys = data['valleys']
+                for i, v in enumerate(valleys):
+                    label = 'L'
+                    if i > 0:
+                        label = 'HL' if smoothed[v] > smoothed[valleys[i-1]] else 'LL'
+                        
+                    ax.scatter(v, smoothed[v], color='#33FF66', marker='^', zorder=5)
+                    ax.annotate(label, (v, smoothed[v]), textcoords="offset points", 
+                                xytext=(0,-15), ha='center', fontsize=8, color='#33FF66', fontweight='bold')
+
+                # Dynamic Title styling
+                title_color = '#00FFCC' if data['conf'] >= CONF_THRESHOLD else 'white'
+                ax.set_title(f"{data['symbol'].upper()} | {data['pattern']} | SOBOL: {data['conf']:.1f}%", 
+                             loc='left', color=title_color, fontsize=11, fontweight='bold')
+            else:
+                ax.set_title(f"{data['symbol'].upper()} | SYNCING BUFFER: {len(y_vals)}/{LOOKBACK_SIZE}", 
+                             loc='left', color='yellow', fontsize=10)
+            
+            ax.grid(alpha=0.1, linestyle='--')
+            plt.draw()
+            plt.pause(0.001)
+        else:
+            plt.pause(0.01)
