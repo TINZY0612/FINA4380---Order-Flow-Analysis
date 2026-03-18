@@ -1,4 +1,5 @@
 import matplotlib
+# Forces the window to pop out (Stable for VS Code/Windows)
 matplotlib.use('TkAgg') 
 
 import numpy as np
@@ -40,19 +41,40 @@ def quantum_inspired_conf(raw_data, observed_var, bw):
     return (1 - (count / SIM_QUANTUM)) * 100
 
 def detect_patterns(peaks, valleys, y_smoothed):
-    """Identifies basic trend structures based on local extrema"""
-    if len(peaks) < 2 or len(valleys) < 2:
+    """Analyzes the geometry of peaks/valleys to identify classic chart patterns."""
+    if len(peaks) < 3 or len(valleys) < 3:
         return "INITIALIZING"
     
-    # Get last two confirmed peaks and valleys
-    p1, p2 = y_smoothed[peaks[-2]], y_smoothed[peaks[-1]]
-    v1, v2 = y_smoothed[valleys[-2]], y_smoothed[valleys[-1]]
+    # Extract values for the last 3 peaks and valleys
+    p = [y_smoothed[i] for i in peaks[-3:]]
+    v = [y_smoothed[i] for i in valleys[-3:]]
     
-    if p2 > p1 and v2 > v1: return "BULLISH CHANNEL"
-    if p2 < p1 and v2 < v1: return "BEARISH CHANNEL"
-    if p2 > p1 and v2 < v1: return "EXPANDING RANGE"
-    if p2 < p1 and v2 > v1: return "CONSOLIDATING"
-    return "NEUTRAL"
+    # 0.1% equality threshold for 'Double' or 'Shoulder' alignment
+    thresh = 0.001 
+
+    # 1. REVERSAL: Head and Shoulders (Middle peak higher than surroundings)
+    if p[-2] > p[-1] and p[-2] > p[-3] and abs(p[-1] - p[-3]) / p[-3] < thresh * 2:
+        return "HEAD & SHOULDERS"
+    
+    # 2. REVERSAL: Inverse Head and Shoulders (Middle valley lower)
+    if v[-2] < v[-1] and v[-2] < v[-3] and abs(v[-1] - v[-3]) / v[-3] < thresh * 2:
+        return "INV HEAD & SHOULDERS"
+
+    # 3. REVERSAL: Double Top / Double Bottom
+    if abs(p[-1] - p[-2]) / p[-2] < thresh:
+        return "DOUBLE TOP"
+    if abs(v[-1] - v[-2]) / v[-2] < thresh:
+        return "DOUBLE BOTTOM"
+
+    # 4. TRIANGLES: Consolidating (Lower Highs, Higher Lows)
+    if p[-1] < p[-2] and v[-1] > v[-2]:
+        return "SYMMETRICAL TRIANGLE"
+    
+    # 5. TREND CHANNELS (Existing Features)
+    if p[-1] > p[-2] and v[-1] > v[-2]: return "BULLISH CHANNEL"
+    if p[-1] < p[-2] and v[-1] < v[-2]: return "BEARISH CHANNEL"
+    
+    return "NEUTRAL / RANGE"
 
 def math_worker():
     while True:
@@ -73,8 +95,7 @@ def math_worker():
                     smoothed, _ = kr.fit(x)
                     conf = quantum_inspired_conf(y, np.var(smoothed), bw)
                     
-                    # --- EXTREMA DETECTION (Local Peaks/Valleys) ---
-                    # distance=10 ensures we don't catch every tiny micro-wiggle
+                    # Extrema Detection
                     peaks, _ = find_peaks(smoothed, distance=10)
                     valleys, _ = find_peaks(-smoothed, distance=10)
                     pattern = detect_patterns(peaks, valleys, smoothed)
@@ -93,7 +114,6 @@ def math_worker():
             task_queue.task_done()
         time.sleep(0.001)
 
-# --- CONNECTIVITY ENGINE ---
 def on_message(ws, message):
     try:
         raw = json.loads(message)
@@ -101,19 +121,17 @@ def on_message(ws, message):
         symbol = raw.get('stream', data.get('s', '')).split('@')[0].lower()
         if not symbol: return
         price = float(data.get('p', data.get('b', [[0]])[0][0]))
-        if price > 0:
-            task_queue.put((symbol, price))
+        if price > 0: task_queue.put((symbol, price))
     except: pass
 
 def run_ws():
-    # Force port 443 for stability
+    # Force Port 443 for stability against university firewalls
     streams = "/".join([f"{s}@trade" for s in SYMBOLS])
     url = f"wss://stream.binance.com:443/stream?streams={streams}"
-    print(f">>> CONNECTING TO BINANCE CLOUD...")
+    print(f">>> CONNECTING SECURELY TO BINANCE...")
     ws = websocket.WebSocketApp(url, on_message=on_message)
     ws.run_forever()
 
-# --- UI ENGINE ---
 if __name__ == "__main__":
     threading.Thread(target=math_worker, daemon=True).start()
     threading.Thread(target=run_ws, daemon=True).start()
@@ -122,7 +140,7 @@ if __name__ == "__main__":
     fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
     plt.ion()
     
-    print(">>> SYSTEM LIVE: Receiving real-time stream...")
+    print(">>> ENGINE LIVE: Awaiting Port 443 Packets...")
 
     while True:
         if not ui_queue.empty():
@@ -131,45 +149,34 @@ if __name__ == "__main__":
             ax = axes[idx]
             ax.clear()
             
-            y_vals = data['y']
-            ax.plot(y_vals, color='#444444', alpha=0.5, label='Raw Ticks')
+            ax.plot(data['y'], color='#444444', alpha=0.5, label='Price')
             
             if data['ready']:
                 smoothed = np.array(data['smoothed'])
                 ax.plot(smoothed, color='#00FFCC', linewidth=2)
                 
-                # --- PLOT PEAKS ---
-                peaks = data['peaks']
-                for i, p in enumerate(peaks):
-                    label = 'H'
-                    if i > 0:
-                        label = 'HH' if smoothed[p] > smoothed[peaks[i-1]] else 'LH'
-                    
+                # Plot Peaks (H/HH/LH)
+                for i, p in enumerate(data['peaks']):
                     ax.scatter(p, smoothed[p], color='#FF3366', marker='v', zorder=5)
-                    ax.annotate(label, (p, smoothed[p]), textcoords="offset points", 
-                                xytext=(0,10), ha='center', fontsize=8, color='#FF3366', fontweight='bold')
+                    label = 'HH' if i > 0 and smoothed[p] > smoothed[data['peaks'][i-1]] else 'LH'
+                    ax.annotate(label, (p, smoothed[p]), textcoords="offset points", xytext=(0,10), 
+                                ha='center', fontsize=8, color='#FF3366', fontweight='bold')
                 
-                # --- PLOT VALLEYS ---
-                valleys = data['valleys']
-                for i, v in enumerate(valleys):
-                    label = 'L'
-                    if i > 0:
-                        label = 'HL' if smoothed[v] > smoothed[valleys[i-1]] else 'LL'
-                        
+                # Plot Valleys (L/HL/LL)
+                for i, v in enumerate(data['valleys']):
                     ax.scatter(v, smoothed[v], color='#33FF66', marker='^', zorder=5)
-                    ax.annotate(label, (v, smoothed[v]), textcoords="offset points", 
-                                xytext=(0,-15), ha='center', fontsize=8, color='#33FF66', fontweight='bold')
+                    label = 'HL' if i > 0 and smoothed[v] > smoothed[data['valleys'][i-1]] else 'LL'
+                    ax.annotate(label, (v, smoothed[v]), textcoords="offset points", xytext=(0,-15), 
+                                ha='center', fontsize=8, color='#33FF66', fontweight='bold')
 
-                # Dynamic Title styling
                 title_color = '#00FFCC' if data['conf'] >= CONF_THRESHOLD else 'white'
                 ax.set_title(f"{data['symbol'].upper()} | {data['pattern']} | SOBOL: {data['conf']:.1f}%", 
                              loc='left', color=title_color, fontsize=11, fontweight='bold')
             else:
-                ax.set_title(f"{data['symbol'].upper()} | SYNCING BUFFER: {len(y_vals)}/{LOOKBACK_SIZE}", 
-                             loc='left', color='yellow', fontsize=10)
+                ax.set_title(f"{data['symbol'].upper()} | BUFFERING: {len(data['y'])}/120", loc='left', color='yellow')
             
             ax.grid(alpha=0.1, linestyle='--')
             plt.draw()
             plt.pause(0.001)
         else:
-            plt.pause(0.01)
+            plt.pause(0.05)
