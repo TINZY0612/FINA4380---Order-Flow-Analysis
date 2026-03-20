@@ -1,7 +1,3 @@
-import matplotlib
-# Forces the window to pop out (Stable for VS Code/Windows)
-matplotlib.use('TkAgg') 
-
 import numpy as np
 import matplotlib.pyplot as plt
 from statsmodels.nonparametric.kernel_regression import KernelReg
@@ -15,13 +11,49 @@ from queue import Queue
 
 # --- CONFIG ---
 SYMBOLS = ["btcusdt", "ethusdt", "solusdt"]
-LOOKBACK_SIZE = 120    
-SIM_QUANTUM = 12        
+LOOKBACK_SIZE = 120         
+SIM_QUANTUM = 12            
 CONF_THRESHOLD = 85.0
+STARTING_CASH = 10000.0
 
 task_queue = Queue()
 ui_queue = Queue()
 state = {s: {"prices": [], "ready": False} for s in SYMBOLS}
+
+# --- SIMULATION ENGINE ---
+class SimulatedBroker:
+    def __init__(self):
+        self.balance = STARTING_CASH
+        self.positions = {s: {"qty": 0, "entry_price": 0} for s in SYMBOLS}
+        self.pnl_history = []
+
+    def process_signal(self, symbol, price, pattern, conf):
+        pos = self.positions[symbol]
+        signal = "HOLD"
+
+        # ENTRY: High Confidence + Reversal or Bullish Trend
+        if pos["qty"] == 0 and conf >= CONF_THRESHOLD:
+            if pattern in ["BULLISH CHANNEL", "INV HEAD & SHOULDERS", "DOUBLE BOTTOM"]:
+                # Allocate 20% of current balance per trade
+                risk_amt = self.balance * 0.2
+                pos["qty"] = risk_amt / price
+                pos["entry_price"] = price
+                self.balance -= risk_amt
+                signal = "BUY"
+
+        # EXIT: Pattern Breakdown or Bearish Reversal
+        elif pos["qty"] > 0:
+            if pattern in ["BEARISH CHANNEL", "HEAD & SHOULDERS", "DOUBLE TOP"] or conf < 50:
+                realized = pos["qty"] * price
+                trade_pnl = realized - (pos["qty"] * pos["entry_price"])
+                self.balance += realized
+                self.pnl_history.append(trade_pnl)
+                pos["qty"] = 0
+                signal = "SELL"
+        
+        return signal, self.balance
+
+broker = SimulatedBroker()
 
 # --- QUANTUM-INSPIRED MATH ---
 def quantum_inspired_conf(raw_data, observed_var, bw):
@@ -41,39 +73,18 @@ def quantum_inspired_conf(raw_data, observed_var, bw):
     return (1 - (count / SIM_QUANTUM)) * 100
 
 def detect_patterns(peaks, valleys, y_smoothed):
-    """Analyzes the geometry of peaks/valleys to identify classic chart patterns."""
-    if len(peaks) < 3 or len(valleys) < 3:
-        return "INITIALIZING"
-    
-    # Extract values for the last 3 peaks and valleys
+    if len(peaks) < 3 or len(valleys) < 3: return "INITIALIZING"
     p = [y_smoothed[i] for i in peaks[-3:]]
     v = [y_smoothed[i] for i in valleys[-3:]]
-    
-    # 0.1% equality threshold for 'Double' or 'Shoulder' alignment
     thresh = 0.001 
 
-    # 1. REVERSAL: Head and Shoulders (Middle peak higher than surroundings)
-    if p[-2] > p[-1] and p[-2] > p[-3] and abs(p[-1] - p[-3]) / p[-3] < thresh * 2:
-        return "HEAD & SHOULDERS"
-    
-    # 2. REVERSAL: Inverse Head and Shoulders (Middle valley lower)
-    if v[-2] < v[-1] and v[-2] < v[-3] and abs(v[-1] - v[-3]) / v[-3] < thresh * 2:
-        return "INV HEAD & SHOULDERS"
-
-    # 3. REVERSAL: Double Top / Double Bottom
-    if abs(p[-1] - p[-2]) / p[-2] < thresh:
-        return "DOUBLE TOP"
-    if abs(v[-1] - v[-2]) / v[-2] < thresh:
-        return "DOUBLE BOTTOM"
-
-    # 4. TRIANGLES: Consolidating (Lower Highs, Higher Lows)
-    if p[-1] < p[-2] and v[-1] > v[-2]:
-        return "SYMMETRICAL TRIANGLE"
-    
-    # 5. TREND CHANNELS (Existing Features)
+    if p[-2] > p[-1] and p[-2] > p[-3] and abs(p[-1] - p[-3]) / p[-3] < thresh * 2: return "HEAD & SHOULDERS"
+    if v[-2] < v[-1] and v[-2] < v[-3] and abs(v[-1] - v[-3]) / v[-3] < thresh * 2: return "INV HEAD & SHOULDERS"
+    if abs(p[-1] - p[-2]) / p[-2] < thresh: return "DOUBLE TOP"
+    if abs(v[-1] - v[-2]) / v[-2] < thresh: return "DOUBLE BOTTOM"
+    if p[-1] < p[-2] and v[-1] > v[-2]: return "SYMMETRICAL TRIANGLE"
     if p[-1] > p[-2] and v[-1] > v[-2]: return "BULLISH CHANNEL"
     if p[-1] < p[-2] and v[-1] < v[-2]: return "BEARISH CHANNEL"
-    
     return "NEUTRAL / RANGE"
 
 def math_worker():
@@ -95,10 +106,12 @@ def math_worker():
                     smoothed, _ = kr.fit(x)
                     conf = quantum_inspired_conf(y, np.var(smoothed), bw)
                     
-                    # Extrema Detection
                     peaks, _ = find_peaks(smoothed, distance=10)
                     valleys, _ = find_peaks(-smoothed, distance=10)
                     pattern = detect_patterns(peaks, valleys, smoothed)
+
+                    # Execute Trade Simulation
+                    trade_sig, bal = broker.process_signal(symbol, y[-1], pattern, conf)
 
                     payload.update({
                         'smoothed': smoothed.tolist(), 
@@ -106,6 +119,8 @@ def math_worker():
                         'peaks': peaks.tolist(),
                         'valleys': valleys.tolist(),
                         'pattern': pattern,
+                        'signal': trade_sig,
+                        'balance': bal,
                         'ready': True
                     })
                 except: pass
@@ -119,16 +134,13 @@ def on_message(ws, message):
         raw = json.loads(message)
         data = raw.get('data', raw)
         symbol = raw.get('stream', data.get('s', '')).split('@')[0].lower()
-        if not symbol: return
         price = float(data.get('p', data.get('b', [[0]])[0][0]))
         if price > 0: task_queue.put((symbol, price))
     except: pass
 
 def run_ws():
-    # Force Port 443 for stability against university firewalls
     streams = "/".join([f"{s}@trade" for s in SYMBOLS])
     url = f"wss://stream.binance.com:443/stream?streams={streams}"
-    print(f">>> CONNECTING SECURELY TO BINANCE...")
     ws = websocket.WebSocketApp(url, on_message=on_message)
     ws.run_forever()
 
@@ -149,34 +161,26 @@ if __name__ == "__main__":
             ax = axes[idx]
             ax.clear()
             
-            ax.plot(data['y'], color='#444444', alpha=0.5, label='Price')
+            ax.plot(data['y'], color='#444444', alpha=0.5)
             
             if data['ready']:
                 smoothed = np.array(data['smoothed'])
                 ax.plot(smoothed, color='#00FFCC', linewidth=2)
                 
-                # Plot Peaks (H/HH/LH)
-                for i, p in enumerate(data['peaks']):
-                    ax.scatter(p, smoothed[p], color='#FF3366', marker='v', zorder=5)
-                    label = 'HH' if i > 0 and smoothed[p] > smoothed[data['peaks'][i-1]] else 'LH'
-                    ax.annotate(label, (p, smoothed[p]), textcoords="offset points", xytext=(0,10), 
-                                ha='center', fontsize=8, color='#FF3366', fontweight='bold')
-                
-                # Plot Valleys (L/HL/LL)
-                for i, v in enumerate(data['valleys']):
-                    ax.scatter(v, smoothed[v], color='#33FF66', marker='^', zorder=5)
-                    label = 'HL' if i > 0 and smoothed[v] > smoothed[data['valleys'][i-1]] else 'LL'
-                    ax.annotate(label, (v, smoothed[v]), textcoords="offset points", xytext=(0,-15), 
-                                ha='center', fontsize=8, color='#33FF66', fontweight='bold')
+                # Highlight Buy/Sell Signals
+                if data['signal'] == "BUY":
+                    ax.axvline(x=LOOKBACK_SIZE-1, color='lime', linestyle='--', alpha=0.8)
+                elif data['signal'] == "SELL":
+                    ax.axvline(x=LOOKBACK_SIZE-1, color='red', linestyle='--', alpha=0.8)
 
                 title_color = '#00FFCC' if data['conf'] >= CONF_THRESHOLD else 'white'
-                ax.set_title(f"{data['symbol'].upper()} | {data['pattern']} | SOBOL: {data['conf']:.1f}%", 
-                             loc='left', color=title_color, fontsize=11, fontweight='bold')
+                ax.set_title(f"{data['symbol'].upper()} | {data['pattern']} | SOBOL: {data['conf']:.1f}% | BAL: ${data['balance']:.2f}", 
+                             loc='left', color=title_color, fontsize=10, fontweight='bold')
             else:
-                ax.set_title(f"{data['symbol'].upper()} | BUFFERING: {len(data['y'])}/120", loc='left', color='yellow')
+                ax.set_title(f"{data['symbol'].upper()} | BUFFERING...", loc='left', color='yellow')
             
-            ax.grid(alpha=0.1, linestyle='--')
+            ax.grid(alpha=0.05)
             plt.draw()
             plt.pause(0.001)
         else:
-            plt.pause(0.05)
+            plt.pause(0.01)
